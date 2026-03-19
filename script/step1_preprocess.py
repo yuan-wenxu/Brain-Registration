@@ -1,3 +1,6 @@
+import PIL.Image
+PIL.Image.MAX_IMAGE_PIXELS = None
+
 import os
 import argparse
 import json
@@ -59,7 +62,7 @@ def _extract_brain_mask(gray_resampled):
         mask_out = binary_fill_holes(mask_in)
         mask_out = morphology.remove_small_objects(mask_out.astype(bool), min_size=min_px)
         mask_out = morphology.remove_small_holes(mask_out.astype(bool), area_threshold=hole_px)
-        mask_out = morphology.binary_closing(mask_out, morphology.disk(2))
+        mask_out = morphology.binary_closing(mask_out, morphology.disk(10))
         labeled = measure.label(mask_out)
         if labeled.max() > 0:
             counts = np.bincount(labeled.ravel())
@@ -73,7 +76,7 @@ def _extract_brain_mask(gray_resampled):
         mask = _clean_mask(x > 0)
     else:
         th = float(threshold_otsu(diff))
-        th_loose = max(dmin, th * 0.78)
+        th_loose = max(dmin, th * 0.55)
         mask = _clean_mask(diff > th_loose)
 
     coverage = float(mask.mean())
