@@ -136,14 +136,14 @@ def nonlinear_register(
 
     bspline_init = sitk.BSplineTransformInitializer(
         image1=fixed_for_metric,
-        transformDomainMeshSize=[6, 6],
+        transformDomainMeshSize=[10, 10],
         order=3,
     )
 
     reg = sitk.ImageRegistrationMethod()
     reg.SetMetricAsMattesMutualInformation(numberOfHistogramBins=64)
-    reg.SetMetricSamplingStrategy(reg.RANDOM)
-    reg.SetMetricSamplingPercentage(0.3, seed=int(random_seed) + 17)
+    reg.SetMetricSamplingStrategy(reg.REGULAR)
+    reg.SetMetricSamplingPercentage(0.3)
     reg.SetInterpolator(sitk.sitkLinear)
     reg.SetOptimizerAsGradientDescent(
         learningRate=0.1,

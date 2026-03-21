@@ -39,24 +39,39 @@ def _load_nissl_image(nissl_path, atlas_slice=None):
     return image
 
 
-def _resize_sitk_to_reference(image, reference, is_label=False):
-    """Resample image to match reference shape, preserving physical coordinates.
-    
-    Uses SimpleITK Resample to avoid distorting anatomical structures.
-    """
-    if image.GetSize() == reference.GetSize():
-        return image
-    
-    interpolator = sitk.sitkNearestNeighbor if is_label else sitk.sitkLinear
-    resampled = sitk.Resample(
-        image,
-        reference,
-        sitk.Transform(2, sitk.sitkIdentity),
-        interpolator,
-        0.0,
-        image.GetPixelID(),
-    )
-    return resampled
+def _place_on_canvas(arr, tissue_mask, canvas_width=1152, canvas_height=832, is_label=False):
+    masked = arr.astype(np.float32) * tissue_mask.astype(np.float32)
+    nz = np.argwhere(tissue_mask)
+    canvas = np.zeros((canvas_height, canvas_width), dtype=np.float32)
+
+    if nz.size == 0:
+        return canvas.astype(np.uint16 if is_label else np.float32)
+
+    r0, c0 = nz.min(axis=0)
+    r1, c1 = nz.max(axis=0)
+    crop = masked[r0:r1 + 1, c0:c1 + 1]
+    mask_crop = tissue_mask[r0:r1 + 1, c0:c1 + 1].astype(np.float32)
+
+    ch, cw = crop.shape
+    mask_crop = (mask_crop > 0.5).astype(np.float32)
+
+    copy_h = min(ch, canvas_height)
+    copy_w = min(cw, canvas_width)
+    if copy_h <= 0 or copy_w <= 0:
+        return canvas.astype(np.uint16 if is_label else np.float32)
+
+    src_top = max(0, (ch - copy_h) // 2)
+    src_left = max(0, (cw - copy_w) // 2)
+    dst_top = max(0, (canvas_height - copy_h) // 2)
+    dst_left = max(0, (canvas_width - copy_w) // 2)
+
+    crop_view = crop[src_top:src_top + copy_h, src_left:src_left + copy_w]
+    mask_view = mask_crop[src_top:src_top + copy_h, src_left:src_left + copy_w]
+    canvas[dst_top:dst_top + copy_h, dst_left:dst_left + copy_w] = crop_view * mask_view
+
+    if is_label:
+        return np.rint(np.clip(canvas, 0, np.iinfo(np.uint16).max)).astype(np.uint16)
+    return canvas.astype(np.float32)
 
 
 def _region_stats_and_centroids(label_arr):
@@ -182,7 +197,17 @@ def apply_transform_to_label(
 
     # ---- load reference ----
     label = _load_label_image(label_path, atlas_slice=atlas_slice)
-    #label = _resize_sitk_to_reference(label, reference, is_label=True)
+    label_arr = sitk.GetArrayFromImage(label).astype(np.uint16)
+    label_mask = label_arr > 0
+    label_canvas_arr = _place_on_canvas(
+        label_arr,
+        label_mask,
+        canvas_width=int(reference.GetWidth()),
+        canvas_height=int(reference.GetHeight()),
+        is_label=True,
+    )
+    label = sitk.GetImageFromArray(label_canvas_arr)
+    label.SetSpacing([1.0, 1.0])
 
     # ---- load and apply transforms ----
     warped_label = _resample_once_with_composite(
@@ -203,16 +228,6 @@ def apply_transform_to_label(
     if nissl_path is not None:
         nissl_img = _load_nissl_image(nissl_path, atlas_slice=atlas_slice)
         nissl_arr = sitk.GetArrayFromImage(nissl_img)
-        '''
-        nissl_img = _resize_sitk_to_reference(nissl_img, reference, is_label=False)
-        warped_nissl = _sequential_resample(
-            nissl_img, reference, full_chain_forward,
-            interpolator=sitk.sitkLinear, fill_value=0.0,
-        )
-        warped_nissl_arr = sitk.GetArrayFromImage(warped_nissl)
-        warped_nissl_tif = output_path.replace('.tif', '_warped_nissl_gray.tif')
-        io.imsave(warped_nissl_tif, _gray_to_u8(warped_nissl_arr))
-        '''
         annotation_nissl_merge_tif = output_path.replace('_label.tif', '_annotation_nissl_merge.tif')
         _save_label_overlay_tif(nissl_arr, warped_arr, annotation_nissl_merge_tif, alpha=0.45)
 

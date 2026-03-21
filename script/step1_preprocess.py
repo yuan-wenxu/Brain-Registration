@@ -114,7 +114,8 @@ def _save_masked_brain_on_canvas(
     mask_canvas = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
 
     if nz.size == 0:
-        io.imsave(output_path, canvas.astype(np.uint16))
+        if output_path is not None:
+            io.imsave(output_path, canvas.astype(np.uint16))
         if mask_canvas_output_path is not None:
             io.imsave(mask_canvas_output_path, mask_canvas)
         return
@@ -144,9 +145,12 @@ def _save_masked_brain_on_canvas(
     mask_canvas[top:top + ch, left:left + cw] = (mask_crop * 255).astype(np.uint8)
 
     canvas_u16 = (np.clip(canvas, 0, 1) * 65535).astype(np.uint16)
-    io.imsave(output_path, canvas_u16)
+    if output_path is not None:
+        io.imsave(output_path, canvas_u16)
     if mask_canvas_output_path is not None:
         io.imsave(mask_canvas_output_path, mask_canvas)
+    
+    return canvas, mask_canvas
 
 
 def preprocess_image(
@@ -195,7 +199,7 @@ def preprocess_image(
 
     canvas_output_path = str(mask_output_path).replace('_mask.tif', '_masked_on_1152x832_black.tif')
     mask_canvas_output_path = str(mask_output_path).replace('_mask.tif', '_mask_on_1152x832_black.tif')
-    _save_masked_brain_on_canvas(
+    _, _ = _save_masked_brain_on_canvas(
         gray_resampled,
         tissue_mask,
         canvas_output_path,

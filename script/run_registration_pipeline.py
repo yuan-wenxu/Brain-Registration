@@ -13,14 +13,14 @@ def build_arg_parser():
 
     parser.add_argument('--data-path', help='image path')
 
-    parser.add_argument('--atlas-nissl', help='atlas nissl path (relative to data-dir)')
-    parser.add_argument('--atlas-annotation', help='atlas annotation path (relative to data-dir)')
+    parser.add_argument('--atlas-nissl', default='/mnt/dbit/data/registration/AllenCCF/ara_nissl_10.npy', help='atlas nissl path (relative to data-dir)')
+    parser.add_argument('--atlas-annotation', default='/mnt/dbit/data/registration/AllenCCF/annotation_10.npy', help='atlas annotation path (relative to data-dir)')
 
-    parser.add_argument('--input-res', type=float, help='step1 input resolution (um/px)')
+    parser.add_argument('--input-res', type=float, default=0.294, help='step1 input resolution (um/px)')
     parser.add_argument('--target-res', type=float, default=10.0, help='step1 target resolution (um/px)')
 
     parser.add_argument('--atlas-slice', type=int, default=None, help='step2 specify slice; if not filled, search automatically')
-    parser.add_argument('--slice-search-radius', type=int, default=220, help='step2 search radius')
+    parser.add_argument('--slice-search-radius', type=int, default=200, help='step2 search radius')
     parser.add_argument('--slice-search-step', type=int, default=20, help='step2 search step')
     parser.add_argument('--search-resize-max', type=int, default=768, help='step2 maximum边 during search')
     parser.add_argument('--random-seed', type=int, default=2026, help='random seed (step2/step3)')

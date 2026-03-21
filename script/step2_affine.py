@@ -9,6 +9,7 @@ from skimage import io, transform, filters
 import SimpleITK as sitk
 from matplotlib import cm
 from matplotlib import pyplot as plt
+from step1_preprocess import _extract_brain_mask, _save_masked_brain_on_canvas
 
 def _set_global_determinism(seed=2026, sitk_threads=1):
     np.random.seed(int(seed))
@@ -31,33 +32,11 @@ def _load_fixed_2d(path):
         arr = color.rgb2gray(arr)
     return _normalize_01(arr)
 
-def _resize_to_shape(arr, target_shape):
-    if arr.shape == target_shape:
-        return arr.astype(np.float32)
-    out = transform.resize(arr, target_shape, preserve_range=True, anti_aliasing=True)
-    return out.astype(np.float32)
 
 def _to_sitk(arr):
     img = sitk.GetImageFromArray(arr.astype(np.float32))
     img.SetSpacing([1.0, 1.0])
     return img
-
-
-def _estimate_binary_centroid(mask_arr):
-    idx = np.argwhere(mask_arr > 0)
-    if idx.size == 0:
-        return None
-    rc = idx.mean(axis=0)
-    return float(rc[0]), float(rc[1])
-
-
-def _build_foreground_mask(arr, percentile=70.0):
-    x = _normalize_01(arr)
-    pos = x[x > 0]
-    if pos.size < 16:
-        return (x > 0).astype(np.uint8)
-    threshold = float(np.percentile(pos, float(percentile)))
-    return (x >= threshold).astype(np.uint8)
 
 
 def _edge_ncc(a, b, mask=None):
@@ -82,7 +61,7 @@ def _build_dense_focus_weight(arr, percentile=75.0, gamma=2.0):
     threshold = float(np.percentile(x, percentile))
     denom = max(1e-6, 1.0 - threshold)
     focus = np.clip((x - threshold) / denom, 0.0, 1.0)
-    weight = 0.35 + 0.65 * np.power(focus, gamma)
+    weight = 0.1 + 0.9 * np.power(focus, gamma)
     return weight.astype(np.float32)
 
 
@@ -103,21 +82,21 @@ def _weighted_ncc(a, b, w):
 
 def _register_rigid_affine_bspline_for_score(fixed_arr, moving_arr, idx, seed=0, dense_weight_map=None, score_mask=None):
     fixed = _to_sitk(fixed_arr)
-    moving = _to_sitk(moving_arr)
-    fixed_mask_img = None
-    if score_mask is not None:
-        mask_u8 = (score_mask > 0.5).astype(np.uint8)
-        if int(mask_u8.sum()) >= 16:
-            fixed_mask_img = sitk.GetImageFromArray(mask_u8)
-            fixed_mask_img.SetSpacing([1.0, 1.0])
+    moving_mask = _extract_brain_mask(moving_arr)
+    moving, _ = _save_masked_brain_on_canvas(
+        moving_arr,
+        moving_mask,
+        output_path=None,
+        canvas_width=768,
+        canvas_height=555,
+    )
+    moving = _to_sitk(moving)
 
     rigid_init = sitk.CenteredTransformInitializer(
         fixed, moving, sitk.Euler2DTransform(), sitk.CenteredTransformInitializerFilter.GEOMETRY
     )
     reg1 = sitk.ImageRegistrationMethod()
     reg1.SetMetricAsMattesMutualInformation(50)
-    if fixed_mask_img is not None:
-        reg1.SetMetricFixedMask(fixed_mask_img)
     reg1.SetMetricSamplingStrategy(reg1.RANDOM)
     reg1.SetMetricSamplingPercentage(0.25, seed=seed + 7)
     reg1.SetInterpolator(sitk.sitkLinear)
@@ -129,19 +108,18 @@ def _register_rigid_affine_bspline_for_score(fixed_arr, moving_arr, idx, seed=0,
     reg1.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
     reg1.SetInitialTransform(rigid_init, inPlace=False)
     rigid_tx = reg1.Execute(fixed, moving)
+    rigid_tx = sitk.Euler2DTransform(rigid_tx.GetNthTransform(0))
     rigid_mi = float(reg1.GetMetricValue())
     rigid_iterations = int(reg1.GetOptimizerIteration())
     rigid_stop_reason = reg1.GetOptimizerStopConditionDescription()
 
     moving_after_rigid = sitk.Resample(moving, fixed, rigid_tx, sitk.sitkLinear, 0.0, moving.GetPixelID())
 
-    affine_init = sitk.CenteredTransformInitializer(
-        fixed, moving_after_rigid, sitk.AffineTransform(2), sitk.CenteredTransformInitializerFilter.GEOMETRY
-    )
+    affine_tx = sitk.AffineTransform(2)
+    affine_tx.SetCenter(rigid_tx.GetCenter())
+
     reg2 = sitk.ImageRegistrationMethod()
     reg2.SetMetricAsMattesMutualInformation(64)
-    if fixed_mask_img is not None:
-        reg2.SetMetricFixedMask(fixed_mask_img)
     reg2.SetMetricSamplingStrategy(reg2.RANDOM)
     reg2.SetMetricSamplingPercentage(0.25, seed=seed + 13)
     reg2.SetInterpolator(sitk.sitkLinear)
@@ -151,7 +129,7 @@ def _register_rigid_affine_bspline_for_score(fixed_arr, moving_arr, idx, seed=0,
     reg2.SetShrinkFactorsPerLevel([4, 2, 1])
     reg2.SetSmoothingSigmasPerLevel([2, 1, 0])
     reg2.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
-    reg2.SetInitialTransform(affine_init, inPlace=False)
+    reg2.SetInitialTransform(affine_tx, inPlace=True)
     affine_tx = reg2.Execute(fixed, moving_after_rigid)
     affine_mi = float(reg2.GetMetricValue())
     affine_iterations = int(reg2.GetOptimizerIteration())
@@ -161,8 +139,6 @@ def _register_rigid_affine_bspline_for_score(fixed_arr, moving_arr, idx, seed=0,
     bspline_init = sitk.BSplineTransformInitializer(fixed, [6, 6], order=3)
     reg3 = sitk.ImageRegistrationMethod()
     reg3.SetMetricAsMattesMutualInformation(64)
-    if fixed_mask_img is not None:
-        reg3.SetMetricFixedMask(fixed_mask_img)
     reg3.SetMetricSamplingStrategy(reg3.RANDOM)
     reg3.SetMetricSamplingPercentage(0.2, seed=seed + 23)
     reg3.SetInterpolator(sitk.sitkLinear)
@@ -183,19 +159,10 @@ def _register_rigid_affine_bspline_for_score(fixed_arr, moving_arr, idx, seed=0,
 
     edge_ncc = _edge_ncc(fixed_arr, moved_bspline_arr, mask=score_mask)
     if dense_weight_map is None:
-        dense_weight_map = _build_dense_focus_weight(fixed_arr)
+        dense_weight_map = _build_dense_focus_weight(fixed_arr, percentile=85.0, gamma=2.0)
     dense_ncc = _weighted_ncc(fixed_arr.astype(np.float32), moved_bspline_arr.astype(np.float32), dense_weight_map)
 
-    base_score = bspline_mi - 0.12 * edge_ncc - 0.22 * dense_ncc
-
-    rigid_iter_ratio = rigid_iterations / 140.0
-    affine_iter_ratio = affine_iterations / 220.0
-    bspline_iter_ratio = bspline_iterations / 140.0
-    iter_level = 0.15 * rigid_iter_ratio + 0.25 * affine_iter_ratio + 0.60 * bspline_iter_ratio
-    iter_jump = 0.5 * max(0.0, affine_iter_ratio - rigid_iter_ratio) + 0.5 * max(0.0, bspline_iter_ratio - affine_iter_ratio)
-    iteration_penalty = 0.16 * np.sqrt(max(0.0, iter_level)) + 0.12 * np.sqrt(max(0.0, iter_jump))
-
-    score = base_score + iteration_penalty
+    score = bspline_mi - 0.12 * edge_ncc - 0.22 * dense_ncc
 
     return {
         'rigid_mi': rigid_mi,
@@ -209,27 +176,19 @@ def _register_rigid_affine_bspline_for_score(fixed_arr, moving_arr, idx, seed=0,
         'bspline_stop_reason': bspline_stop_reason,
         'edge_ncc': edge_ncc,
         'dense_ncc': float(dense_ncc),
-        'base_score': float(base_score),
-        'iter_level': float(iter_level),
-        'iter_jump': float(iter_jump),
-        'iteration_penalty': float(iteration_penalty),
         'score': float(score),
     }
 
 
 def _final_affine_fullres(fixed_arr, moving_arr, seed=2026, fixed_mask_arr=None):
     fixed = _to_sitk(fixed_arr)
-    moving = _to_sitk(moving_arr)
-
-    fixed_mask_img = None
-    if fixed_mask_arr is not None:
-        mask_u8 = (fixed_mask_arr > 0.5).astype(np.uint8)
-        if int(mask_u8.sum()) >= 16:
-            fixed_mask_img = sitk.GetImageFromArray(mask_u8)
-            fixed_mask_img.SetSpacing([1.0, 1.0])
-
-    #if fixed.GetSize() != moving.GetSize():
-        #moving = sitk.Resample(moving, fixed, sitk.Transform(), sitk.sitkLinear, 0.0, moving.GetPixelID())
+    moving_mask = _extract_brain_mask(moving_arr)
+    moving, _ = _save_masked_brain_on_canvas(
+        moving_arr,
+        moving_mask,
+        output_path=None,
+    )
+    moving = _to_sitk(moving)
 
     rigid_init = sitk.CenteredTransformInitializer(
         fixed, moving, sitk.Euler2DTransform(), sitk.CenteredTransformInitializerFilter.GEOMETRY
@@ -237,8 +196,6 @@ def _final_affine_fullres(fixed_arr, moving_arr, seed=2026, fixed_mask_arr=None)
 
     reg_rigid = sitk.ImageRegistrationMethod()
     reg_rigid.SetMetricAsMattesMutualInformation(50)
-    if fixed_mask_img is not None:
-        reg_rigid.SetMetricFixedMask(fixed_mask_img)
     reg_rigid.SetMetricSamplingStrategy(reg_rigid.RANDOM)
     reg_rigid.SetMetricSamplingPercentage(0.25, seed=int(seed) + 101)
     reg_rigid.SetInterpolator(sitk.sitkLinear)
@@ -251,18 +208,16 @@ def _final_affine_fullres(fixed_arr, moving_arr, seed=2026, fixed_mask_arr=None)
     reg_rigid.SetInitialTransform(rigid_init, inPlace=False)
 
     rigid_tx = reg_rigid.Execute(fixed, moving)
+    rigid_tx = sitk.Euler2DTransform(rigid_tx.GetNthTransform(0))
     rigid_mi = float(reg_rigid.GetMetricValue())
     rigid_iterations = int(reg_rigid.GetOptimizerIteration())
     moving_after_rigid = sitk.Resample(moving, fixed, rigid_tx, sitk.sitkLinear, 0.0, moving.GetPixelID())
 
-    affine_init = sitk.CenteredTransformInitializer(
-        fixed, moving_after_rigid, sitk.AffineTransform(2), sitk.CenteredTransformInitializerFilter.GEOMETRY
-    )
+    affine_tx = sitk.AffineTransform(2)
+    affine_tx.SetCenter(rigid_tx.GetCenter())
 
     reg = sitk.ImageRegistrationMethod()
     reg.SetMetricAsMattesMutualInformation(64)
-    if fixed_mask_img is not None:
-        reg.SetMetricFixedMask(fixed_mask_img)
     reg.SetMetricSamplingStrategy(reg.RANDOM)
     reg.SetMetricSamplingPercentage(0.25, seed=int(seed) + 131)
     reg.SetInterpolator(sitk.sitkLinear)
@@ -272,7 +227,7 @@ def _final_affine_fullres(fixed_arr, moving_arr, seed=2026, fixed_mask_arr=None)
     reg.SetShrinkFactorsPerLevel([8, 4, 2, 1])
     reg.SetSmoothingSigmasPerLevel([4, 2, 1, 0])
     reg.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
-    reg.SetInitialTransform(affine_init, inPlace=False)
+    reg.SetInitialTransform(affine_tx, inPlace=False)
 
     affine_tx = reg.Execute(fixed, moving_after_rigid)
     affine_mi = float(reg.GetMetricValue())
@@ -344,9 +299,7 @@ def _apply_neighbor_score_regularization(records, neighbor_smooth_sigma=3.0):
 
     for row in records:
         idx = int(row['slice_idx'])
-        slice_best_raw = float(per_slice_best[idx])
         slice_score_smoothed = float(smoothed[idx])
-        row['slice_best_score_raw'] = slice_best_raw
         row['slice_score_smoothed'] = slice_score_smoothed
 
 
@@ -379,7 +332,7 @@ def _save_slice_score_curve(records, output_png_path):
     plt.grid(True, alpha=0.25)
     plt.legend(loc='best', frameon=False)
     plt.tight_layout()
-    plt.savefig(output_png_path)
+    plt.savefig(output_png_path, bbox_inches='tight')
     plt.close()
 
 
@@ -389,7 +342,7 @@ def affine_register(
     output_path,
     mask_path=None,
     atlas_slice=None,
-    slice_search_radius=220,
+    slice_search_radius=200,
     slice_search_step=20,
     search_resize_max=768,
     random_seed=2026,
@@ -407,15 +360,14 @@ def affine_register(
         raise ValueError('moving_path must be a 3D atlas npy file')
 
     total = atlas.shape[0]
-    center = total // 2 if atlas_slice is None else int(atlas_slice)
-    center = max(0, min(total - 1, center))
+    center =650
 
     scale = min(1.0, search_resize_max / max(fixed_full.shape))
     if scale < 1.0:
         fixed_search = transform.rescale(fixed_full, scale, preserve_range=True, anti_aliasing=True).astype(np.float32)
     else:
         fixed_search = fixed_full.copy().astype(np.float32)
-    dense_weight_full = _build_dense_focus_weight(fixed_full, percentile=75.0, gamma=2.0)
+    dense_weight_full = _build_dense_focus_weight(fixed_full, percentile=85.0, gamma=2.0)
 
     # load mask
     mask_search = None
@@ -432,7 +384,7 @@ def affine_register(
             mask_search = (mask_search > 0.5).astype(np.float32)
         else:
             mask_search = mask_full.copy().astype(np.float32)
-        #dense_weight_full = dense_weight_full * mask_full
+
         print(f'Tissue mask applied to weight map, coverage={mask_full.mean()*100:.1f}%')
     else:
         print('No tissue mask provided; using full-image weight map.')
@@ -473,7 +425,7 @@ def affine_register(
             fixed_search,
             moving,
             idx,
-            seed=int(random_seed) + seed_offset + idx,
+            seed=int(random_seed) + seed_offset,
             dense_weight_map=dense_weight_map,
             score_mask=mask_search,
         )
@@ -506,13 +458,13 @@ def affine_register(
     _apply_neighbor_score_regularization(records, neighbor_smooth_sigma=neighbor_smooth_sigma)
 
     ranked_slices = _rank_slices_by_smoothed_score(records)
-    topk_slices = [int(item[0]) for item in ranked_slices[:6]]
+    topk_slices = [int(item[0]) for item in ranked_slices[:3]]
 
     refine_candidates = set()
     fine_step = max(1, slice_search_step // 6)
-    fine_radius = max(12, int(slice_search_step * 1.5))
+    fine_radius = max(10, int(slice_search_step * 0.75))
     for c in topk_slices:
-        for i in range(max(0, c - fine_radius), min(total - 1, c + fine_radius) + 1, fine_step):
+        for i in range(max(coarse_left, c - fine_radius), min(coarse_right, c + fine_radius) + 1, fine_step):
             refine_candidates.add(i)
     refine_candidates = sorted(refine_candidates)
     print(f'Refine candidates around top-k: n={len(refine_candidates)}')
@@ -525,7 +477,7 @@ def affine_register(
     ultra_radius = max(6, slice_search_step // 2)
     ultra_candidates = set()
     for c in ultra_centers:
-        for i in range(max(0, c - ultra_radius), min(total - 1, c + ultra_radius) + 1):
+        for i in range(max(coarse_left, c - ultra_radius), min(coarse_right, c + ultra_radius) + 1):
             ultra_candidates.add(i)
     ultra_candidates = sorted(ultra_candidates)
     print(f'Ultra-refine candidates around best-2: n={len(ultra_candidates)}')
@@ -583,10 +535,7 @@ def affine_register(
                 'rigid_mi', 'rigid_iterations', 'rigid_stop_reason',
                 'affine_mi', 'affine_iterations', 'affine_stop_reason',
                 'bspline_mi', 'bspline_iterations', 'bspline_stop_reason',
-                'edge_ncc', 'dense_ncc',
-                'base_score', 'iter_level', 'iter_jump', 'iteration_penalty',
-                'score',
-                'slice_best_score_raw', 'slice_score_smoothed',
+                'edge_ncc', 'dense_ncc', 'score', 'slice_score_smoothed',
             ],
         )
         writer.writeheader()
@@ -612,32 +561,14 @@ def affine_register(
             'coarse_candidates': coarse_candidates,
             'refine_candidates': refine_candidates,
             'ultra_candidates': ultra_candidates,
-            'score_terms': {
-                'base_score': 'bspline_mi - 0.12*edge_ncc - 0.22*dense_ncc',
-                'iter_level': '0.15*(rigid_iter/140) + 0.25*(affine_iter/220) + 0.60*(bspline_iter/140)',
-                'iter_jump': '0.5*max(0,affine_ratio-rigid_ratio) + 0.5*max(0,bspline_ratio-affine_ratio)',
-                'iteration_penalty': '0.16*sqrt(iter_level) + 0.12*sqrt(iter_jump)',
-                'base_final_score': 'base_score + iteration_penalty',
-                'neighbor_smooth_sigma': float(neighbor_smooth_sigma),
-                'selection_score': 'slice_score_smoothed = gaussian_smooth(slice_best_score_raw, sigma=neighbor_smooth_sigma)',
-            },
         },
         'best_candidate_metrics': best,
-        'centroid_init_translation_xy': final_info.get('centroid_init_translation_xy'),
-        'final_resample_mode': final_info.get('final_resample_mode'),
-        'residual_centroid_delta_rc': final_info.get('residual_centroid_delta_rc'),
-        'residual_correction_applied': final_info.get('residual_correction_applied'),
-        'residual_correction_translation_xy': final_info.get('residual_correction_translation_xy'),
         'final_rigid_metric_mi': final_info['rigid_metric_mi'],
         'final_rigid_iterations': final_info['rigid_iterations'],
-        'final_rigid_translation_xy': final_info.get('rigid_translation_xy'),
-        'final_rigid_translation_clamped': final_info.get('rigid_translation_clamped'),
         'final_rigid_stop_reason': final_info['rigid_stop_reason'],
         'final_affine_metric_mi': final_info['affine_metric_mi'],
         'final_affine_iterations': final_info['affine_iterations'],
         'final_affine_stop_reason': final_info['affine_stop_reason'],
-        'rigid_transform_path': merged_tx_path,
-        'affine_transform_path': merged_tx_path,
         'merged_rigid_affine_transform_path': merged_tx_path,
         'deformation_chain_forward': [
             {'step': 'step2_rigid_affine_merged', 'transform_path': merged_tx_path, 'type': 'CompositeTransform'},
@@ -667,7 +598,7 @@ def _build_arg_parser():
     parser.add_argument('-o', '--output-path', required=True, help='affine registration output tif path')
     parser.add_argument('--mask-path', default=None, help='tissue mask tif (step1 output, _mask.tif); constrains dense weight to tissue')
     parser.add_argument('-as', '--atlas-slice', type=int, default=None, help='specify atlas slice number; if not provided, search automatically')
-    parser.add_argument('-sr', '--slice-search-radius', type=int, default=220, help='slice search radius for step2')
+    parser.add_argument('-sr', '--slice-search-radius', type=int, default=200, help='slice search radius for step2')
     parser.add_argument('-ss', '--slice-search-step', type=int, default=20, help='slice search step for step2')
     parser.add_argument('-sm', '--search-resize-max', type=int, default=768, help='maximum side length of images during search stage')
     parser.add_argument('-rs', '--random-seed', type=int, default=2026, help='random seed (for reproducible registration)')

@@ -108,7 +108,7 @@ Step2 evaluates candidate slices in 3 stages:
 
 ### Per-slice scoring method
 
-For each candidate slice:
+#### For each candidate slice:
 
 1. Run **rigid** registration (MI metric).
 2. Run **affine** registration (MI metric).
@@ -117,10 +117,12 @@ For each candidate slice:
    - `bspline_mi`
    - edge similarity (`edge_ncc`)
    - dense-focus weighted NCC (`dense_ncc`)
-   - iteration-based penalty (`iter_level`, `iter_jump`, `iteration_penalty`)
-5. Final score combines similarity and penalty terms.
 
 Then slice-level best scores are smoothed along slice index using Gaussian kernel (`neighbor_smooth_sigma`) and ranked.
+
+#### Scoring function:
+1. score = bspline_mi - 0.12 * edge_ncc - 0.22 * dense_ncc
+2. smoothed
 
 ### Final registration
 
@@ -166,7 +168,7 @@ Refine Step2 alignment using B-spline deformation.
 
 1. Load fixed/moving images.
 2. Optionally read Step2 `dense_weight.tif` and build a continuous metric-weight map.
-3. Initialize B-spline transform (mesh `[6, 6]`, order `3`).
+3. Initialize B-spline transform (mesh `[10, 10]`, order `3`).
 4. Optimize MI metric with multi-resolution pyramid.
 5. Resample moving image to fixed space using optimized B-spline transform.
 
@@ -239,7 +241,7 @@ cd script
 python run_registration_pipeline.py \
   --data-path /path/to/input.tif \
   --atlas-nissl /path/to/Allen_nissl_atlas \
-  --atlas-annotation  /path/to/Allen_annotation_atlas \
+  --atlas-annotation /path/to/Allen_annotation_atlas \
   --input-res resolution (whole_brain.tif) \
   --target-res resolution (Allen) \
   --search-workers 8
