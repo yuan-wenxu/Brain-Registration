@@ -183,7 +183,6 @@ def _register_rigid_affine_bspline_for_score(fixed_arr, moving_arr, idx, seed=0,
 def _final_affine_fullres(fixed_arr, moving_arr, seed=2026, fixed_mask_arr=None):
     fixed = _to_sitk(fixed_arr)
     moving_mask = np.ones_like(moving_arr)
-    io.imsave('debug_moving_mask.tif', (moving_mask.astype(np.uint8) * 255))
     moving, _ = _save_masked_brain_on_canvas(
         moving_arr,
         moving_mask,
