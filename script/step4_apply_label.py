@@ -124,15 +124,6 @@ def _save_label_overlay_tif(reference_arr, label_arr, output_rgb_tif, alpha=0.45
     io.imsave(output_rgb_tif, out)
 
 
-def _sequential_resample(image, reference, transform_paths, interpolator=sitk.sitkLinear, fill_value=0.0):
-    """ according to the order of transform_paths, sequentially resample the image to the reference space """
-    current = image
-    for path in transform_paths:
-        tx = sitk.ReadTransform(path)
-        current = sitk.Resample(current, reference, tx, interpolator, fill_value, current.GetPixelID())
-    return current
-
-
 def _resample_once_with_composite(image, reference, transform_paths, interpolator=sitk.sitkLinear, fill_value=0.0):
     merged = sitk.CompositeTransform(2)
     for path in transform_paths:
@@ -198,7 +189,7 @@ def apply_transform_to_label(
     # ---- load reference ----
     label = _load_label_image(label_path, atlas_slice=atlas_slice)
     label_arr = sitk.GetArrayFromImage(label).astype(np.uint16)
-    label_mask = label_arr > 0
+    label_mask = np.ones_like(label_arr, dtype=np.uint8)
     label_canvas_arr = _place_on_canvas(
         label_arr,
         label_mask,

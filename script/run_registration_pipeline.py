@@ -13,8 +13,8 @@ def build_arg_parser():
 
     parser.add_argument('--data-path', help='image path')
 
-    parser.add_argument('--atlas-nissl', default='/mnt/dbit/data/registration/AllenCCF/ara_nissl_10.npy', help='atlas nissl path (relative to data-dir)')
-    parser.add_argument('--atlas-annotation', default='/mnt/dbit/data/registration/AllenCCF/annotation_10.npy', help='atlas annotation path (relative to data-dir)')
+    parser.add_argument('--atlas-nissl', help='atlas nissl path (relative to data-dir)')
+    parser.add_argument('--atlas-annotation', help='atlas annotation path (relative to data-dir)')
 
     parser.add_argument('--input-res', type=float, default=0.294, help='step1 input resolution (um/px)')
     parser.add_argument('--target-res', type=float, default=10.0, help='step1 target resolution (um/px)')
@@ -27,7 +27,6 @@ def build_arg_parser():
     parser.add_argument('--sitk-threads', type=int, default=1, help='SimpleITK global thread count (recommended 1 for reproducibility)')
     parser.add_argument('--search-workers', type=int, default=1, help='step2 parallel worker count for slice search (recommended 2-8)')
     parser.add_argument('--neighbor-smooth-sigma', type=float, default=3.0, help='step2 neighbor smooth sigma for better slice selection (in pixel, recommend 1-3)')
-
     return parser
 
 

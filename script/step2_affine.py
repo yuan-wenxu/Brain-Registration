@@ -182,7 +182,8 @@ def _register_rigid_affine_bspline_for_score(fixed_arr, moving_arr, idx, seed=0,
 
 def _final_affine_fullres(fixed_arr, moving_arr, seed=2026, fixed_mask_arr=None):
     fixed = _to_sitk(fixed_arr)
-    moving_mask = _extract_brain_mask(moving_arr)
+    moving_mask = np.ones_like(moving_arr)
+    io.imsave('debug_moving_mask.tif', (moving_mask.astype(np.uint8) * 255))
     moving, _ = _save_masked_brain_on_canvas(
         moving_arr,
         moving_mask,
@@ -521,6 +522,7 @@ def affine_register(
     _save_overlay_rgb_tif(fixed_full, reg_arr, overlay_rgb_tif, alpha=0.45, cmap_name='turbo')
 
     dense_weight_tif = output_path.replace('_affine.tif', '_dense_weight.tif')
+    dense_weight_full = dense_weight_full * mask_full if mask_search is not None else dense_weight_full
     _save_weight_map_tif(dense_weight_full, dense_weight_tif)
 
     slice_score_curve_png = output_path.replace('_affine.tif', '_slice_score_curve.png')

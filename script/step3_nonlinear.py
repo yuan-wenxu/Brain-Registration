@@ -52,6 +52,103 @@ def _to_sitk_with_like(arr, like_image):
     return img
 
 
+def _to_mask_sitk_with_like(mask_arr, like_image):
+    img = sitk.GetImageFromArray((mask_arr > 0).astype(np.uint8))
+    img.CopyInformation(like_image)
+    return img
+
+
+def _load_mask(fixed_mask_path, target_shape):
+    if fixed_mask_path is None or not os.path.exists(str(fixed_mask_path)):
+        return None, None, None
+
+    mask = io.imread(str(fixed_mask_path))
+    if mask.ndim == 3:
+        mask = mask[..., 0]
+    mask = (mask > 0).astype(np.float32)
+
+    if mask.shape != target_shape:
+        mask = transform.resize(
+            mask,
+            target_shape,
+            order=0,
+            preserve_range=True,
+            anti_aliasing=False,
+        ).astype(np.float32)
+
+    mask = (mask > 0.5).astype(np.float32)
+    coverage = float(np.mean(mask > 0))
+    if coverage < 0.01:
+        return None, str(fixed_mask_path), {'coverage': coverage, 'reason': 'too_sparse'}
+
+    stats = {
+        'coverage': coverage,
+        'mask_min': float(mask.min()),
+        'mask_max': float(mask.max()),
+        'mask_mean': float(mask.mean()),
+    }
+    return mask.astype(np.float32), str(fixed_mask_path), stats
+
+
+def _run_bspline_stage(
+    fixed_img,
+    moving_img,
+    mesh_size,
+    stage_name,
+    metric_history,
+    initial_transform=None,
+    sampling_percentage=0.25,
+    learning_rate=0.08,
+    number_of_iterations=260,
+    shrink_factors=None,
+    smoothing_sigmas=None,
+):
+    if shrink_factors is None:
+        shrink_factors = [8, 4, 2, 1]
+    if smoothing_sigmas is None:
+        smoothing_sigmas = [4, 2, 1, 0]
+
+    if initial_transform is None:
+        bspline_init = sitk.BSplineTransformInitializer(
+            image1=fixed_img,
+            transformDomainMeshSize=[int(mesh_size), int(mesh_size)],
+            order=3,
+        )
+    else:
+        bspline_init = sitk.BSplineTransform(initial_transform)
+
+    reg = sitk.ImageRegistrationMethod()
+    reg.SetMetricAsMattesMutualInformation(numberOfHistogramBins=64)
+    reg.SetMetricSamplingStrategy(reg.REGULAR)
+    reg.SetMetricSamplingPercentage(float(sampling_percentage))
+
+    reg.SetInterpolator(sitk.sitkLinear)
+    reg.SetOptimizerAsGradientDescent(
+        learningRate=float(learning_rate),
+        numberOfIterations=int(number_of_iterations),
+        convergenceMinimumValue=1e-8,
+        convergenceWindowSize=20,
+    )
+    reg.SetOptimizerScalesFromPhysicalShift()
+    reg.SetShrinkFactorsPerLevel(shrink_factors)
+    reg.SetSmoothingSigmasPerLevel(smoothing_sigmas)
+    reg.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+    reg.SetInitialTransform(bspline_init, inPlace=True)
+
+    def _iter_cb():
+        metric_history.append((reg.GetOptimizerIteration(), float(reg.GetMetricValue()), stage_name))
+
+    reg.AddCommand(sitk.sitkIterationEvent, _iter_cb)
+    stage_tx = reg.Execute(fixed_img, moving_img)
+    return {
+        'name': stage_name,
+        'transform': stage_tx,
+        'final_metric': float(reg.GetMetricValue()),
+        'stop': reg.GetOptimizerStopConditionDescription(),
+        'iterations': int(reg.GetOptimizerIteration()),
+    }
+
+
 def _load_dense_weight_from_step2(step2_record_json, target_shape):
     if step2_record_json is None or not os.path.exists(str(step2_record_json)):
         return None, None, None
@@ -84,14 +181,13 @@ def _load_dense_weight_from_step2(step2_record_json, target_shape):
 
     coverage = float(np.mean(weight > 1e-6))
     if coverage < 0.01:
-        return None, dense_weight_tif, {'coverage': coverage, 'threshold': 0.0}
+        return None, dense_weight_tif, {'coverage': coverage, 'reason': 'too_sparse'}
 
     stats = {
         'coverage': coverage,
         'weight_min': float(weight.min()),
         'weight_max': float(weight.max()),
         'weight_mean': float(weight.mean()),
-        'weight_style': 'direct dense_weight continuous weight',
     }
     return weight.astype(np.float32), dense_weight_tif, stats
 
@@ -102,6 +198,8 @@ def nonlinear_register(
     output_path,
     transform_path,
     step2_record_json=None,
+    mesh_size=10,
+    sampling_percentage=0.25,
     random_seed=2026,
     sitk_threads=1,
 ):
@@ -113,55 +211,58 @@ def nonlinear_register(
 
     metric_history = []
 
+    dense_weight_arr = None
+    dense_weight_tif_used = None
+    dense_weight_stats = None
+    metric_weight_tif = None
+
     dense_weight_arr, dense_weight_tif_used, dense_weight_stats = _load_dense_weight_from_step2(
         step2_record_json,
         target_shape=fixed_arr.shape,
     )
-    metric_weight_tif = None
-    fixed_for_metric = fixed
-    moving_for_metric = moving
     if dense_weight_arr is not None:
-        weight_for_metric = np.clip(dense_weight_arr, 0.0, 1.0)
-        weight_for_metric = 0.12 + 0.88 * np.power(weight_for_metric, 1.6)
-        moving_arr = sitk.GetArrayFromImage(moving)
-        fixed_weighted_arr = fixed_arr * weight_for_metric
-        moving_weighted_arr = moving_arr * weight_for_metric
-        fixed_for_metric = _to_sitk_with_like(fixed_weighted_arr, fixed)
-        moving_for_metric = _to_sitk_with_like(moving_weighted_arr, moving)
-        metric_weight_tif = str(output_path).replace('_nonlinear.tif', '_metric_weight_from_dense_weight.tif')
-        io.imsave(metric_weight_tif, (np.clip(weight_for_metric, 0, 1) * 65535).astype(np.uint16))
-        print(f'Using direct dense-weight as continuous metric weight for step3, coverage={dense_weight_stats["coverage"]*100:.1f}%')
-    elif dense_weight_tif_used is not None:
-        print(f'Dense-weight file found but invalid for weighting: {dense_weight_tif_used}')
+        soft_weight = np.clip(dense_weight_arr, 0.0, 1.0)
+        soft_weight = np.where(soft_weight > 0.1, soft_weight, 0.0)
 
-    bspline_init = sitk.BSplineTransformInitializer(
-        image1=fixed_for_metric,
-        transformDomainMeshSize=[10, 10],
-        order=3,
+        fixed_weighted_arr = fixed_arr * soft_weight
+        fixed_weighted_arr = _to_sitk_with_like(fixed_weighted_arr, fixed)
+
+        metric_weight_tif = str(output_path).replace('_nonlinear.tif', '_weight_from_step2_dense_weight.tif')
+        io.imsave(metric_weight_tif, (np.clip(soft_weight, 0, 1) * 65535).astype(np.uint16))
+        print(f'Using weighted metric in step3 stage1, coverage={dense_weight_stats["coverage"]*100:.1f}%')
+
+    stage_summaries = []
+
+    stage1 = _run_bspline_stage(
+        fixed_img=fixed_weighted_arr,
+        moving_img=moving,
+        mesh_size=mesh_size,
+        stage_name='bspline_coarse',
+        metric_history=metric_history,
+        sampling_percentage=sampling_percentage,
+        learning_rate=0.005,
+        number_of_iterations=200,
+        shrink_factors=[8, 4, 2, 1],
+        smoothing_sigmas=[4, 2, 1, 0],
     )
-
-    reg = sitk.ImageRegistrationMethod()
-    reg.SetMetricAsMattesMutualInformation(numberOfHistogramBins=64)
-    reg.SetMetricSamplingStrategy(reg.REGULAR)
-    reg.SetMetricSamplingPercentage(0.3)
-    reg.SetInterpolator(sitk.sitkLinear)
-    reg.SetOptimizerAsGradientDescent(
-        learningRate=0.1,
-        numberOfIterations=480,
-        convergenceMinimumValue=1e-8,
-        convergenceWindowSize=20,
+    stage_summaries.append({k: v for k, v in stage1.items() if k != 'transform'})
+    
+    stage2 = _run_bspline_stage(
+        fixed_img=fixed,
+        moving_img=moving,
+        mesh_size=mesh_size,
+        stage_name='bspline_refine',
+        metric_history=metric_history,
+        initial_transform=stage1['transform'],
+        sampling_percentage=sampling_percentage,
+        learning_rate=0.01,
+        number_of_iterations=180,
+        shrink_factors=[4, 2, 1],
+        smoothing_sigmas=[2, 1, 0],
     )
-    reg.SetOptimizerScalesFromPhysicalShift()
-    reg.SetShrinkFactorsPerLevel([8, 6, 4, 2, 1])
-    reg.SetSmoothingSigmasPerLevel([4, 3, 2, 1, 0])
-    reg.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
-    reg.SetInitialTransform(bspline_init, inPlace=True)
-
-    def _iter_cb():
-        metric_history.append((reg.GetOptimizerIteration(), float(reg.GetMetricValue()), 'bspline'))
-
-    reg.AddCommand(sitk.sitkIterationEvent, _iter_cb)
-    bspline_tx = reg.Execute(fixed_for_metric, moving_for_metric)
+    stage_summaries.append({k: v for k, v in stage2.items() if k != 'transform'})
+    bspline_tx = stage2['transform']
+    final_stage = stage2
 
     result = sitk.Resample(moving, fixed, bspline_tx, sitk.sitkLinear, 0.0, moving.GetPixelID())
 
@@ -193,11 +294,14 @@ def nonlinear_register(
         'random_seed': int(random_seed),
         'sitk_threads': int(sitk_threads),
         'dense_weight_tif_used': str(dense_weight_tif_used),
-        'metric_weight_tif': str(metric_weight_tif),
         'dense_weight_stats': dense_weight_stats,
-        'bspline_final_metric': float(reg.GetMetricValue()),
-        'bspline_stop': reg.GetOptimizerStopConditionDescription(),
-        'bspline_iterations': int(reg.GetOptimizerIteration()),
+        'metric_weight_tif': str(metric_weight_tif),
+        'mesh_size': int(mesh_size),
+        'sampling_percentage': float(sampling_percentage),
+        'bspline_stages': stage_summaries,
+        'bspline_final_metric': float(final_stage['final_metric']),
+        'bspline_stop': final_stage['stop'],
+        'bspline_iterations': int(final_stage['iterations']),
         'adjusted_allen_gray_tif': str(output_path),
         'overlay_rgb_tif': str(post_overlay_rgb_tif),
         'metric_history_csv': str(metrics_csv),
@@ -219,7 +323,13 @@ def _build_arg_parser():
     parser.add_argument('--moving-path', required=True, help='moving image path (step2 output)')
     parser.add_argument('--output-path', required=True, help='nonlinear registration result output tif path')
     parser.add_argument('--transform-path', required=True, help='B-spline transform output path (h5)')
+    parser.add_argument('--fixed-mask-path', default=None, help='step1 mask path for metric masking')
+    parser.add_argument('--use-metric-mask', type=int, default=1, choices=[0, 1], help='whether to use step1 mask in step3 metric (1=yes, 0=no)')
+    parser.add_argument('--metric-mode', type=str, default='weighted', choices=['raw', 'weighted'], help='step3 stage1 metric mode')
+    parser.add_argument('--weight-floor', type=float, default=0.25, help='weight floor for weighted stage1 metric to preserve internal structures')
     parser.add_argument('--step2-record-json', default=None, help='step2 record json path (optional)')
+    parser.add_argument('--mesh-size', type=int, default=10, help='B-spline mesh size per dimension (smaller = stiffer transform)')
+    parser.add_argument('--sampling-percentage', type=float, default=0.25, help='metric sampling percentage')
     parser.add_argument('--random-seed', type=int, default=2026, help='random seed (for reproducible registration)')
     parser.add_argument('--sitk-threads', type=int, default=1, help='SimpleITK global thread count (recommended 1 for reproducibility)')
     return parser
@@ -239,7 +349,13 @@ if __name__ == '__main__':
         moving_path=args.moving_path,
         output_path=args.output_path,
         transform_path=args.transform_path,
+        fixed_mask_path=args.fixed_mask_path,
+        use_metric_mask=bool(args.use_metric_mask),
+        metric_mode=args.metric_mode,
+        weight_floor=args.weight_floor,
         step2_record_json=args.step2_record_json,
+        mesh_size=args.mesh_size,
+        sampling_percentage=args.sampling_percentage,
         random_seed=args.random_seed,
         sitk_threads=args.sitk_threads,
     )

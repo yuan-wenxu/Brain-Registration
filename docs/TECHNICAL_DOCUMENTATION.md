@@ -100,7 +100,7 @@ Find the best matching atlas slice and register it to the fixed image using rigi
 
 ### Search strategy
 
-Step2 evaluates candidate slices in 3 stages:
+#### Step2 evaluates candidate slices in 3 stages:
 
 1. **Coarse search** around center with coarse step.
 2. **Refine search** around top-ranked coarse slices with finer step.
@@ -117,6 +117,10 @@ Step2 evaluates candidate slices in 3 stages:
    - `bspline_mi`
    - edge similarity (`edge_ncc`)
    - dense-focus weighted NCC (`dense_ncc`)
+
+The edge focuses on gradient changes in the image.  
+The dense of background is 0.  
+Only images within the mask have dense.  
 
 Then slice-level best scores are smoothed along slice index using Gaussian kernel (`neighbor_smooth_sigma`) and ranked.
 
@@ -148,7 +152,7 @@ Under `02.affine/`:
 - `search_workers` increases throughput but may raise CPU pressure.
 - Use `sitk_threads=1` for stronger reproducibility.
 - If alignment is unstable, tune search radius/step and smoothing sigma first.
-
+- `<name>_dense_weight.tif` is not used for dense scoring. Its background is 0.
 ---
 
 ## 3. Step3: Nonlinear Refinement (`step3_nonlinear.py`)
@@ -169,8 +173,9 @@ Refine Step2 alignment using B-spline deformation.
 1. Load fixed/moving images.
 2. Optionally read Step2 `dense_weight.tif` and build a continuous metric-weight map.
 3. Initialize B-spline transform (mesh `[10, 10]`, order `3`).
-4. Optimize MI metric with multi-resolution pyramid.
-5. Resample moving image to fixed space using optimized B-spline transform.
+4. Weighted image registration and original image registration.
+5. Optimize MI metric with multi-resolution pyramid.
+6. Resample moving image to fixed space using optimized B-spline transform.
 
 ### Outputs
 
