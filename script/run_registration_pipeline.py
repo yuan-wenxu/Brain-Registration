@@ -6,6 +6,7 @@ from step1_preprocess import preprocess_image
 from step2_affine import affine_register
 from step3_nonlinear import nonlinear_register
 from step4_apply_label import apply_transform_to_label
+from step5_roi_mask import generate_roi_masks
 
 
 def build_arg_parser():
@@ -22,16 +23,20 @@ def build_arg_parser():
     parser.add_argument('--atlas-slice', type=int, default=None, help='step2 specify slice; if not filled, search automatically')
     parser.add_argument('--slice-search-radius', type=int, default=200, help='step2 search radius')
     parser.add_argument('--slice-search-step', type=int, default=20, help='step2 search step')
-    parser.add_argument('--search-resize-max', type=int, default=768, help='step2 maximum边 during search')
+    parser.add_argument('--search-resize-max', type=float, default=0.6, help='step2 maximum边 during search')
     parser.add_argument('--random-seed', type=int, default=2026, help='random seed (step2/step3)')
     parser.add_argument('--sitk-threads', type=int, default=1, help='SimpleITK global thread count (recommended 1 for reproducibility)')
     parser.add_argument('--search-workers', type=int, default=1, help='step2 parallel worker count for slice search (recommended 2-8)')
     parser.add_argument('--neighbor-smooth-sigma', type=float, default=3.0, help='step2 neighbor smooth sigma for better slice selection (in pixel, recommend 1-3)')
+
+    parser.add_argument('--roi-txt-path', default=None, help='step5 ROI list txt path (one ROI per line), default uses docs/ROI.txt if exists')
+    parser.add_argument('--structure-tree-csv', default=None, help='step5 structure_tree_safe_2017.csv path')
     return parser
 
 
 def main():
     args = build_arg_parser().parse_args()
+    project_root = Path(__file__).resolve().parent.parent
     serial_input_path = args.data_path
     img_name = os.path.basename(serial_input_path).split('.')[0]
     output_root = Path(serial_input_path).parent
@@ -124,6 +129,26 @@ def main():
         step3_record_json=step3_record_json,
         nissl_path=step3_info['adjusted_allen_gray_tif'],  # optional, for better visualization
     )
+
+    # Step 5 (optional)
+    step4_record_json = str(warped_label_path).replace('_label.tif', '_step4_record.json')
+    default_roi_txt = project_root / 'docs' / 'ROI.txt'
+    roi_txt_path = args.roi_txt_path if args.roi_txt_path is not None else (str(default_roi_txt) if default_roi_txt.exists() else None)
+    structure_tree_csv = args.structure_tree_csv
+
+    if roi_txt_path is None:
+        print('Step5 skipped: ROI txt path is not provided and default docs/ROI.txt does not exist')
+    elif structure_tree_csv is None:
+        print('Step5 skipped: --structure-tree-csv is required to generate ROI masks')
+    else:
+        step5_dir = output_root / '05.roi_mask'
+        step5_dir.mkdir(exist_ok=True)
+        generate_roi_masks(
+            step4_record_json=step4_record_json,
+            roi_txt_path=roi_txt_path,
+            structure_tree_csv=structure_tree_csv,
+            output_dir=str(step5_dir),
+        )
 
     print('Registration pipeline finished!')
 

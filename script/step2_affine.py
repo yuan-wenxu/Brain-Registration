@@ -3,6 +3,7 @@ import argparse
 import random
 import csv
 import json
+import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 from skimage import io, transform, filters
@@ -10,6 +11,19 @@ import SimpleITK as sitk
 from matplotlib import cm
 from matplotlib import pyplot as plt
 from step1_preprocess import _extract_brain_mask, _save_masked_brain_on_canvas
+
+
+def _cleanup_images(*objects):
+    for obj in objects:
+        if obj is None:
+            continue
+        close_fn = getattr(obj, 'close', None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
+    gc.collect()
 
 def _set_global_determinism(seed=2026, sitk_threads=1):
     np.random.seed(int(seed))
@@ -87,8 +101,6 @@ def _register_rigid_affine_bspline_for_score(fixed_arr, moving_arr, idx, seed=0,
         moving_arr,
         moving_mask,
         output_path=None,
-        canvas_width=768,
-        canvas_height=555,
     )
     moving = _to_sitk(moving)
 
@@ -344,7 +356,7 @@ def affine_register(
     atlas_slice=None,
     slice_search_radius=200,
     slice_search_step=20,
-    search_resize_max=768,
+    search_resize_max=0.6,
     random_seed=2026,
     sitk_threads=1,
     search_workers=1,
@@ -362,12 +374,10 @@ def affine_register(
     total = atlas.shape[0]
     center =650
 
-    scale = min(1.0, search_resize_max / max(fixed_full.shape))
-    if scale < 1.0:
-        fixed_search = transform.rescale(fixed_full, scale, preserve_range=True, anti_aliasing=True).astype(np.float32)
-    else:
-        fixed_search = fixed_full.copy().astype(np.float32)
+    fixed_search = transform.rescale(fixed_full, search_resize_max, 
+                                     preserve_range=True, anti_aliasing=True).astype(np.float32)
     dense_weight_full = _build_dense_focus_weight(fixed_full, percentile=85.0, gamma=2.0)
+    print(3)
 
     # load mask
     mask_search = None
@@ -379,11 +389,9 @@ def affine_register(
                 mask_full, fixed_full.shape, order=0,
                 preserve_range=True, anti_aliasing=False,
             ).astype(np.float32)
-        if scale < 1.0:
-            mask_search = transform.rescale(mask_full, scale, order=0, preserve_range=True, anti_aliasing=False).astype(np.float32)
-            mask_search = (mask_search > 0.5).astype(np.float32)
-        else:
-            mask_search = mask_full.copy().astype(np.float32)
+
+        mask_search = transform.rescale(mask_full, search_resize_max, order=0, preserve_range=True, anti_aliasing=False).astype(np.float32)
+        mask_search = (mask_search > 0.5).astype(np.float32)
 
         print(f'Tissue mask applied to weight map, coverage={mask_full.mean()*100:.1f}%')
     else:
@@ -454,7 +462,7 @@ def affine_register(
                 records.append(row)
                 evaluated[row['slice_idx']] = row
 
-    _evaluate_batch(coarse_candidates, 'coarse', seed_offset=0, scale=scale)
+    _evaluate_batch(coarse_candidates, 'coarse', seed_offset=0, scale=search_resize_max)
     _apply_neighbor_score_regularization(records, neighbor_smooth_sigma=neighbor_smooth_sigma)
 
     ranked_slices = _rank_slices_by_smoothed_score(records)
@@ -469,7 +477,7 @@ def affine_register(
     refine_candidates = sorted(refine_candidates)
     print(f'Refine candidates around top-k: n={len(refine_candidates)}')
 
-    _evaluate_batch(refine_candidates, 'refine', seed_offset=10000, scale=scale)
+    _evaluate_batch(refine_candidates, 'refine', seed_offset=10000, scale=search_resize_max)
     _apply_neighbor_score_regularization(records, neighbor_smooth_sigma=neighbor_smooth_sigma)
 
     ranked_slices = _rank_slices_by_smoothed_score(records)
@@ -481,7 +489,7 @@ def affine_register(
             ultra_candidates.add(i)
     ultra_candidates = sorted(ultra_candidates)
     print(f'Ultra-refine candidates around best-2: n={len(ultra_candidates)}')
-    _evaluate_batch(ultra_candidates, 'ultra', seed_offset=20000, scale=scale)
+    _evaluate_batch(ultra_candidates, 'ultra', seed_offset=20000, scale=search_resize_max)
     _apply_neighbor_score_regularization(records, neighbor_smooth_sigma=neighbor_smooth_sigma)
 
     ranked_slices = _rank_slices_by_smoothed_score(records)
@@ -589,6 +597,18 @@ def affine_register(
     print(f'Merged rigid+affine transform saved to {merged_tx_path}')
     print(f'Step2 record saved to {record_json}')
 
+    _cleanup_images(
+        fixed_full,
+        atlas,
+        fixed_search,
+        dense_weight_full,
+        dense_weight_map,
+        mask_search,
+        mask_full if 'mask_full' in locals() else None,
+        reg_arr,
+        reg_u16,
+    )
+
     return reg_arr, affine_tx, record_json
 
 
@@ -615,17 +635,20 @@ if __name__ == '__main__':
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    reg_arr, affine_tx, info = affine_register(
-        fixed_path=args.fixed_path,
-        moving_path=args.moving_path,
-        output_path=args.output_path,
-        mask_path=args.mask_path,
-        atlas_slice=args.atlas_slice,
-        slice_search_radius=args.slice_search_radius,
-        slice_search_step=args.slice_search_step,
-        search_resize_max=args.search_resize_max,
-        random_seed=args.random_seed,
-        sitk_threads=args.sitk_threads,
-        search_workers=args.search_workers,
-        neighbor_smooth_sigma=args.neighbor_smooth_sigma,
-    )
+    try:
+        reg_arr, affine_tx, info = affine_register(
+            fixed_path=args.fixed_path,
+            moving_path=args.moving_path,
+            output_path=args.output_path,
+            mask_path=args.mask_path,
+            atlas_slice=args.atlas_slice,
+            slice_search_radius=args.slice_search_radius,
+            slice_search_step=args.slice_search_step,
+            search_resize_max=args.search_resize_max,
+            random_seed=args.random_seed,
+            sitk_threads=args.sitk_threads,
+            search_workers=args.search_workers,
+            neighbor_smooth_sigma=args.neighbor_smooth_sigma,
+        )
+    finally:
+        _cleanup_images()

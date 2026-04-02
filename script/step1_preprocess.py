@@ -4,11 +4,25 @@ PIL.Image.MAX_IMAGE_PIXELS = None
 import os
 import argparse
 import json
+import gc
 import numpy as np
 from skimage import io, transform, color, measure
 from skimage.filters import threshold_otsu, gaussian
 from skimage import morphology
 from scipy.ndimage import binary_fill_holes
+
+
+def _cleanup_images(*objects):
+    for obj in objects:
+        if obj is None:
+            continue
+        close_fn = getattr(obj, 'close', None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
+    gc.collect()
 
 
 def _replace_background_values(img_arr):
@@ -104,8 +118,8 @@ def _save_masked_brain_on_canvas(
     gray_resampled,
     tissue_mask,
     output_path,
-    canvas_width=1152,
-    canvas_height=832,
+    canvas_width=1100,
+    canvas_height=800,
     mask_canvas_output_path=None,
 ):
     masked = gray_resampled.astype(np.float32) * tissue_mask.astype(np.float32)
@@ -153,6 +167,60 @@ def _save_masked_brain_on_canvas(
     return canvas, mask_canvas
 
 
+def _save_fullres_canvas(
+    gray_original,
+    tissue_mask_downsampled,
+    downsampled_shape,
+    output_path,
+    canvas_width=1100,
+    canvas_height=800,
+):
+    """Generate canvas at original resolution using the downsampled mask.
+    
+    The canvas dimensions at original resolution are: canvas_width / downsampling_scale, canvas_height / downsampling_scale.
+    """
+    scale_factor = np.array(downsampled_shape, dtype=np.float32) / np.array(gray_original.shape, dtype=np.float32)
+    fullres_canvas_h = int(np.round(canvas_height / scale_factor[0]))
+    fullres_canvas_w = int(np.round(canvas_width / scale_factor[1]))
+    
+    tissue_mask_fullres = transform.resize(
+        tissue_mask_downsampled.astype(np.float32),
+        gray_original.shape,
+        order=0,
+        preserve_range=True,
+        anti_aliasing=False,
+    ).astype(bool)
+    
+    masked = gray_original.astype(np.float32) * tissue_mask_fullres.astype(np.float32)
+    nz = np.argwhere(tissue_mask_fullres)
+    canvas = np.zeros((fullres_canvas_h, fullres_canvas_w), dtype=np.float32)
+    
+    if nz.size == 0:
+        if output_path is not None:
+            io.imsave(output_path, canvas.astype(np.uint16))
+        return
+    
+    r0, c0 = nz.min(axis=0)
+    r1, c1 = nz.max(axis=0)
+    crop = masked[r0:r1 + 1, c0:c1 + 1]
+    
+    ch, cw = crop.shape
+    scale = min(1.0, float(fullres_canvas_h) / max(ch, 1), float(fullres_canvas_w) / max(cw, 1))
+    if scale < 1.0:
+        crop = transform.rescale(crop, scale, preserve_range=True, anti_aliasing=True).astype(np.float32)
+        ch, cw = crop.shape
+    
+    top = max(0, (fullres_canvas_h - ch) // 2)
+    left = max(0, (fullres_canvas_w - cw) // 2)
+    canvas[top:top + ch, left:left + cw] = crop
+    
+    canvas_u16 = (np.clip(canvas, 0, 1) * 65535).astype(np.uint16)
+    if output_path is not None:
+        io.imsave(output_path, canvas_u16)
+    
+    return canvas, (int(fullres_canvas_h), int(fullres_canvas_w))
+
+
 def preprocess_image(
     input_path,
     gray_output_path,
@@ -197,15 +265,26 @@ def preprocess_image(
     tissue_mask = _extract_brain_mask(gray_resampled)
     io.imsave(mask_output_path, (tissue_mask.astype(np.uint8) * 255))
 
-    canvas_output_path = str(mask_output_path).replace('_mask.tif', '_masked_on_1152x832_black.tif')
-    mask_canvas_output_path = str(mask_output_path).replace('_mask.tif', '_mask_on_1152x832_black.tif')
+    canvas_output_path = str(mask_output_path).replace('_mask.tif', '_masked_on_1100x800_black.tif')
+    mask_canvas_output_path = str(mask_output_path).replace('_mask.tif', '_mask_on_1100x800_black.tif')
     _, _ = _save_masked_brain_on_canvas(
         gray_resampled,
         tissue_mask,
         canvas_output_path,
-        canvas_width=1152,
-        canvas_height=832,
+        canvas_width=1100,
+        canvas_height=800,
         mask_canvas_output_path=mask_canvas_output_path,
+    )
+    
+    # Generate high-resolution canvas at original image resolution
+    fullres_canvas_output_path = str(mask_output_path).replace('_mask.tif', '_masked_on_fullres_black.tif')
+    _, fullres_canvas_shape = _save_fullres_canvas(
+        gray,
+        tissue_mask,
+        gray_resampled.shape,
+        fullres_canvas_output_path,
+        canvas_width=1100,
+        canvas_height=800,
     )
 
     nz = np.argwhere(tissue_mask)
@@ -225,19 +304,22 @@ def preprocess_image(
             'mask_path': str(mask_output_path),
             'masked_canvas_path': str(canvas_output_path),
             'mask_canvas_path': str(mask_canvas_output_path),
+            'masked_fullres_canvas_path': str(fullres_canvas_output_path),
         },
         'params': {
             'input_res_um_per_px': float(input_res),
             'target_res_um_per_px': float(target_res),
             'resample_scale': float(scale),
-            'canvas_width': 1152,
-            'canvas_height': 832,
+            'canvas_width': 1100,
+            'canvas_height': 800,
+            'fullres_canvas_shape': [int(fullres_canvas_shape[0]), int(fullres_canvas_shape[1])],
         },
         'stats': {
             'input_shape': [int(v) for v in img_arr.shape],
             'background_replaced_pixels': int(replaced_pixels),
             'gray_shape': [int(v) for v in gray.shape],
             'resampled_shape': [int(v) for v in gray_resampled.shape],
+            'fullres_canvas_shape': [int(fullres_canvas_shape[0]), int(fullres_canvas_shape[1])],
             'mask_coverage': float(tissue_mask.mean()),
             'mask_bbox_r0c0r1c1': mask_bbox,
         },
@@ -247,9 +329,12 @@ def preprocess_image(
 
     print(f'Tissue mask saved to {mask_output_path}')
     print(f'Mask coverage: {tissue_mask.mean() * 100:.2f}%')
-    print(f'Masked brain on 1152x832 black canvas saved to {canvas_output_path}')
-    print(f'Mask on 1152x832 black canvas saved to {mask_canvas_output_path}')
+    print(f'Masked brain on 1100x800 black canvas saved to {canvas_output_path}')
+    print(f'Masked brain on fullres black canvas saved to {fullres_canvas_output_path}')
+    print(f'Mask on 1100x800 black canvas saved to {mask_canvas_output_path}')
     print(f'Step1 record json saved to {record_json_path}')
+
+    _cleanup_images(img_arr, gray, gray_resampled, tissue_mask)
 
     return record_json_path
 
@@ -274,11 +359,14 @@ if __name__ == '__main__':
     if out_dir2:
         os.makedirs(out_dir2, exist_ok=True)
 
-    record_json_path = preprocess_image(
-        input_path=args.input_path,
-        gray_output_path=args.gray_output_path,
-        resampled_output_path=args.resampled_output_path,
-        mask_output_path=args.mask_output_path,
-        input_res=args.input_res,
-        target_res=args.target_res,
-    )
+    try:
+        record_json_path = preprocess_image(
+            input_path=args.input_path,
+            gray_output_path=args.gray_output_path,
+            resampled_output_path=args.resampled_output_path,
+            mask_output_path=args.mask_output_path,
+            input_res=args.input_res,
+            target_res=args.target_res,
+        )
+    finally:
+        _cleanup_images()

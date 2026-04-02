@@ -1,6 +1,6 @@
 # Brain-Registration Technical Documentation
 
-This document provides a detailed technical description of the 4-step registration pipeline in this project.
+This document provides a detailed technical description of the 5-step registration pipeline in this project.
 
 - Pipeline entry: `script/run_registration_pipeline.py`
 - Step scripts:
@@ -8,17 +8,19 @@ This document provides a detailed technical description of the 4-step registrati
   - `script/step2_affine.py`
   - `script/step3_nonlinear.py`
   - `script/step4_apply_label.py`
+  - `script/step5_roi_mask.py`
 
 ---
 
 ## 0. Pipeline Overview
 
-The pipeline performs Allen atlas registration for 2D brain slice images through four stages:
+The pipeline performs Allen atlas registration for 2D brain slice images through five stages:
 
-1. **Step1 Preprocess**: grayscale conversion, resolution normalization, tissue mask extraction, and fixed-size canvas generation.
+1. **Step1 Preprocess**: grayscale conversion, resolution normalization, tissue mask extraction, fixed-size canvas generation, and high-resolution fullres canvas generation.
 2. **Step2 Affine**: atlas slice search and rigid+affine registration.
 3. **Step3 Nonlinear**: B-spline refinement with optional dense-weight-guided metric emphasis.
 4. **Step4 Apply Label**: apply Step2+Step3 transforms to atlas annotation and export region statistics.
+5. **Step5 ROI Mask**: extract individual ROI masks from warped annotation and generate high-resolution grayscale masks.
 
 ### Data flow
 
@@ -57,17 +59,23 @@ Convert the raw image into a robust fixed reference image for registration by st
    - Adaptive fallback for over-coverage and under-coverage cases.
 5. **Canvas normalization**
    - Crop by tissue bbox, optional downscale to fit, center on a fixed black canvas (`1152x832`).
+6. **High-resolution fullres canvas generation**
+   - Generate a canvas at original image resolution for Step5 ROI mask generation.
+   - Dimensions are recorded in `step1_record.json` under `params.fullres_canvas_shape` to enable memory-safe access in Step5.
 
 ### Outputs
 
 Under `01.preprocess/`:
 
-- `<name>_gray.tif`
-- `<name>_resampled.tif`
-- `<name>_mask.tif`
-- `<name>_masked_on_1152x832_black.tif`
-- `<name>_mask_on_1152x832_black.tif`
-- `<name>_step1_record.json`
+- `<name>_gray.tif` - Grayscale image converted from input (uint16)
+- `<name>_resampled.tif` - Resampled to target resolution (uint16)
+- `<name>_mask.tif` - Binary tissue mask (uint8: 0/255)
+- `<name>_masked_on_1152x832_black.tif` - Fixed canvas at standard resolution (1152×832 px, uint16)
+- `<name>_mask_on_1152x832_black.tif` - Tissue mask on fixed canvas (1152×832 px, uint8: 0/255)
+- `<name>_masked_on_fullres_black.tif` - High-resolution canvas at original image resolution (uint16)
+- `<name>_step1_record.json` - Metadata including fullres_canvas_shape for downstream steps
+
+The key output for downstream registration is the **fixed canvas** (`*_masked_on_1152x832_black.tif`). The **fullres canvas** (`*_masked_on_fullres_black.tif`) is generated for high-resolution ROI mask generation in Step5, with dimensions recorded in the JSON record to avoid OOM during Step5 execution.
 
 ### Practical notes
 
@@ -222,11 +230,11 @@ Apply Step2 and Step3 deformation chain to annotation labels and export interpre
 
 Under `04.apply_label/`:
 
-- `<name>_label.tif` (colorized label image)
-- `<name>_overlay.tif` (label overlay on fixed image)
-- `<name>_annotation_nissl_merge.tif` (if nissl is provided)
-- `<name>_region_distribution.csv`
-- `<name>_step4_record.json`
+- `<name>_label.tif` - Colorized label image (RGB, uint8) showing warped annotation regions
+- `<name>_overlay.tif` - Label overlay on fixed reference image for visual verification
+- `<name>_annotation_nissl_merge.tif` - Label overlay on Nissl reference (if `nissl_path` provided)
+- `<name>_region_distribution.csv` - Region-level statistics (pixel_count, area_ratio, centroid coordinates)
+- `<name>_step4_record.json` - Complete deformation chain metadata and registration parameters
 
 ### Practical notes
 
@@ -235,9 +243,66 @@ Under `04.apply_label/`:
 
 ---
 
-## 5. Main Entry Integration (`run_registration_pipeline.py`)
+## 5. Step5: ROI Mask Generation (`step5_roi_mask.py`)
 
-The main script orchestrates Step1 -> Step4 end-to-end and reuses existing outputs when detected.
+### Goal
+
+Extract individual region of interest (ROI) masks from Step4's warped annotation. Generate both downsampled masks (aligned with Step1's 1152×832 canvas) and high-resolution grayscale masks (aligned with original image resolution).
+
+### Inputs
+
+- `step4_record_json`: Step4 output record containing deformation chain and warped label path
+- `roi_txt_path`: Text file with one ROI acronym/name per line (e.g., "CA1", "DG", "PFC")
+- `structure_tree_csv`: Allen structure tree CSV file mapping ROI names to numeric IDs and hierarchies
+- Optional: Step1 record (automatically discovered) containing `fullres_canvas_shape` metadata
+
+### Core processing
+
+1. **Load warped annotation** from Step4 output.
+2. **Resolve ROI names** to numeric IDs using structure tree:
+   - Support both exact acronym match and name prefix match.
+   - Collect all descendant IDs for hierarchical regions.
+3. **Memory-efficient fullres sizing**:
+   - Read `fullres_canvas_shape` from Step1 JSON metadata (avoids loading large fullres image).
+   - Fallback to metadata-only read via SimpleITK if Step1 record unavailable.
+4. **Early ROI skip optimization**:
+   - Pre-check if any label IDs exist in warped annotation before mask computation.
+   - Skip empty/absent ROIs to avoid wasteful processing.
+5. **Mask generation and scaling**:
+   - Create binary mask at downsampled resolution (1152×832).
+   - Scale mask to fullres using Step1 metadata.
+   - Convert to single-channel grayscale PNG (uint8: 0/255) for high-resolution output.
+6. **Generate report** with pixel counts, area ratios, and matched descendant IDs.
+
+### Outputs
+
+Under `05.roi_mask/`:
+
+- `<roi_name>_mask.tif` - Downsampled mask at standard canvas resolution (1152×832 px, uint8: 0/255)
+- `<roi_name>_mask_fullres_gray.png` - High-resolution mask at original image resolution (single-channel grayscale, uint8: 0/255)
+- `roi_mask_report.csv` - Comprehensive ROI summary:
+  - `roi`: ROI acronym/name
+  - `match_mode`: "exact" or "prefix"
+  - `matched_root_ids`: Comma-separated IDs of matched root regions
+  - `descendant_inclusive_id_count`: Total descendant count including matched roots
+  - `pixel_count`: Number of pixels in mask at downsampled resolution
+  - `area_ratio`: Fraction of total canvas area occupied by ROI
+  - `fullres_gray_mask_path`: Path to high-resolution grayscale mask
+- `step5_record.json` - Metadata including ROI list, applied deformation chain, and fullres mask availability status
+
+### Practical notes
+
+- **Memory efficiency**: Step5 reads fullres canvas dimensions from Step1 JSON only; the actual image file is not loaded.
+- **Format choice**: High-resolution masks are saved as **single-channel grayscale PNG** (not RGBA) to reduce file size by 75%.
+- **Hierarchical ROI support**: Structure tree enables automatic inclusion of sub-regions (e.g., requesting "Hippocampus" includes "CA1", "CA3", "DG").
+- **Early filtering**: ROIs with no matching label IDs in the warped annotation are skipped automatically to save computation.
+- **Backward compatibility**: Older Step1 records lacking `fullres_canvas_shape` can still be processed via SimpleITK metadata reads.
+
+---
+
+## 6. Main Entry Integration (`run_registration_pipeline.py`)
+
+The main script orchestrates Step1 -> Step5 end-to-end and reuses existing outputs when detected.
 
 ### Typical command
 
@@ -247,6 +312,8 @@ python run_registration_pipeline.py \
   --data-path /path/to/input.tif \
   --atlas-nissl /path/to/Allen_nissl_atlas \
   --atlas-annotation /path/to/Allen_annotation_atlas \
+  --roi-txt-path /path/to/ROI.txt \
+  --structure-tree-csv /path/to/structure_tree_safe_2017.csv \
   --input-res resolution (whole_brain.tif) \
   --target-res resolution (Allen) \
   --search-workers 8
@@ -254,13 +321,14 @@ python run_registration_pipeline.py \
 
 ### Pipeline behavior
 
-- Creates output root: `<input_name>_registration_result`
+- Creates output root: `<input_name>_registration_result/` with subdirectories `01.preprocess/`, `02.affine/`, `03.nonlinear/`, `04.apply_label/`, `05.roi_mask/`
 - Executes each step in sequence
 - Reads/writes step record JSON files for cross-step parameter/transform propagation
+- Explicit cleanup (`gc.collect()` and `.close()` calls) after each step to release large arrays and prevent OOM
 
 ---
 
-## 6. Reproducibility and Debugging
+## 7. Reproducibility and Debugging
 
 ### Recommended for reproducibility
 
@@ -284,7 +352,7 @@ python run_registration_pipeline.py \
 
 ---
 
-## 7. File Contract Summary
+## 8. File Contract Summary
 
 - Step1 -> Step2:
   - `masked_canvas_path`, `mask_canvas_path`
@@ -292,7 +360,31 @@ python run_registration_pipeline.py \
   - `*_affine.tif`, `*_step2_record.json`, `dense_weight.tif`
 - Step3 -> Step4:
   - `*_nonlinear.h5`, `*_step3_record.json`
-- Step4 final:
-  - label map + overlays + region statistics
+- Step4 -> Step5:
+  - `*_label.tif` (warped annotation from Step4)
+  - `*_step4_record.json` (contains deformation chain)
+  - Step1 record JSON (discovered automatically for `fullres_canvas_shape` metadata)
+- Step5 final:
+  - ROI masks at both downsampled (1152×832) and fullres resolutions
+  - ROI mask report and statistics
 
 This contract should be preserved when modifying scripts to maintain pipeline compatibility.
+
+---
+
+## 9. Memory Management
+
+All five steps implement explicit resource cleanup to prevent OOM (out-of-memory) failures with large images:
+
+- `_cleanup_images()` helper function defined in each step script
+- `gc.collect()` invoked after large array processing
+- `.close()` called on image objects (SimpleITK, PIL, etc.) where applicable
+- try/finally blocks in CLI entry points guarantee cleanup execution
+
+### Memory-critical operations
+
+- **Step1**: High-resolution canvas generation (original image res ~28k×39k)
+- **Step2**: Atlas stack search (3D array with many candidate slices)
+- **Step3**: BSpline transform computation and resampling
+- **Step4**: Label rasterization and region statistics
+- **Step5**: Deferred fullres sizing via metadata-only reads (avoids loading large images)

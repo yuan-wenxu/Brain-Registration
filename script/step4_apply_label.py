@@ -2,9 +2,23 @@ import os
 import argparse
 import csv
 import json
+import gc
 import numpy as np
 import SimpleITK as sitk
 from skimage import io
+
+
+def _cleanup_images(*objects):
+    for obj in objects:
+        if obj is None:
+            continue
+        close_fn = getattr(obj, 'close', None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
+    gc.collect()
 
 
 def _load_label_image(label_path, atlas_slice=None):
@@ -39,7 +53,7 @@ def _load_nissl_image(nissl_path, atlas_slice=None):
     return image
 
 
-def _place_on_canvas(arr, tissue_mask, canvas_width=1152, canvas_height=832, is_label=False):
+def _place_on_canvas(arr, tissue_mask, canvas_width=1100, canvas_height=800, is_label=False):
     masked = arr.astype(np.float32) * tissue_mask.astype(np.float32)
     nz = np.argwhere(tissue_mask)
     canvas = np.zeros((canvas_height, canvas_width), dtype=np.float32)
@@ -257,6 +271,16 @@ def apply_transform_to_label(
         print(f'Annotation-Nissl merge tif saved to {annotation_nissl_merge_tif}')
     print(f'Region distribution saved to {stats_csv}')
     print(f'Step4 record saved to {record_json}')
+
+    _cleanup_images(
+        reference,
+        label,
+        warped_label,
+        warped_arr,
+        ref_arr,
+        nissl_img if 'nissl_img' in locals() else None,
+        nissl_arr if 'nissl_arr' in locals() else None,
+    )
     return warped_label
 
 
@@ -278,12 +302,15 @@ if __name__ == '__main__':
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    apply_transform_to_label(
-        label_path=args.label_path,
-        reference_path=args.reference_path,
-        output_path=args.output_path,
-        atlas_slice=args.atlas_slice,
-        step2_record_json=args.step2_record_json,
-        step3_record_json=args.step3_record_json,
-        nissl_path=args.nissl_path,
-    )
+    try:
+        apply_transform_to_label(
+            label_path=args.label_path,
+            reference_path=args.reference_path,
+            output_path=args.output_path,
+            atlas_slice=args.atlas_slice,
+            step2_record_json=args.step2_record_json,
+            step3_record_json=args.step3_record_json,
+            nissl_path=args.nissl_path,
+        )
+    finally:
+        _cleanup_images()

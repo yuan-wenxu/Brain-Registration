@@ -3,10 +3,24 @@ import argparse
 import random
 import csv
 import json
+import gc
 import numpy as np
 import SimpleITK as sitk
 from skimage import io, transform
 from matplotlib import cm
+
+
+def _cleanup_images(*objects):
+    for obj in objects:
+        if obj is None:
+            continue
+        close_fn = getattr(obj, 'close', None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
+    gc.collect()
 
 
 def _set_global_determinism(seed=2026, sitk_threads=1):
@@ -198,7 +212,7 @@ def nonlinear_register(
     output_path,
     transform_path,
     step2_record_json=None,
-    mesh_size=10,
+    mesh_size=8,
     sampling_percentage=0.25,
     random_seed=2026,
     sitk_threads=1,
@@ -236,14 +250,14 @@ def nonlinear_register(
     stage1 = _run_bspline_stage(
         fixed_img=fixed_weighted_arr,
         moving_img=moving,
-        mesh_size=mesh_size,
+        mesh_size=(mesh_size - 2),
         stage_name='bspline_coarse',
         metric_history=metric_history,
         sampling_percentage=sampling_percentage,
         learning_rate=0.005,
         number_of_iterations=200,
-        shrink_factors=[8, 4, 2, 1],
-        smoothing_sigmas=[4, 2, 1, 0],
+        shrink_factors=[4, 2, 1],
+        smoothing_sigmas=[2, 1, 0],
     )
     stage_summaries.append({k: v for k, v in stage1.items() if k != 'transform'})
     
@@ -314,6 +328,17 @@ def nonlinear_register(
     print(f'Adjusted Allen gray tif saved to {output_path}')
     print(f'Overlay RGB tif saved to {post_overlay_rgb_tif}')
     print(f'Step3 record saved to {record_json}')
+
+    _cleanup_images(
+        fixed,
+        moving,
+        result,
+        fixed_arr,
+        result_arr,
+        dense_weight_arr,
+        soft_weight if 'soft_weight' in locals() else None,
+        fixed_weighted_arr if 'fixed_weighted_arr' in locals() else None,
+    )
     return result, record_json
 
 
@@ -344,18 +369,21 @@ if __name__ == '__main__':
     if tx_dir:
         os.makedirs(tx_dir, exist_ok=True)
 
-    result, record_json = nonlinear_register(
-        fixed_path=args.fixed_path,
-        moving_path=args.moving_path,
-        output_path=args.output_path,
-        transform_path=args.transform_path,
-        fixed_mask_path=args.fixed_mask_path,
-        use_metric_mask=bool(args.use_metric_mask),
-        metric_mode=args.metric_mode,
-        weight_floor=args.weight_floor,
-        step2_record_json=args.step2_record_json,
-        mesh_size=args.mesh_size,
-        sampling_percentage=args.sampling_percentage,
-        random_seed=args.random_seed,
-        sitk_threads=args.sitk_threads,
-    )
+    try:
+        result, record_json = nonlinear_register(
+            fixed_path=args.fixed_path,
+            moving_path=args.moving_path,
+            output_path=args.output_path,
+            transform_path=args.transform_path,
+            fixed_mask_path=args.fixed_mask_path,
+            use_metric_mask=bool(args.use_metric_mask),
+            metric_mode=args.metric_mode,
+            weight_floor=args.weight_floor,
+            step2_record_json=args.step2_record_json,
+            mesh_size=args.mesh_size,
+            sampling_percentage=args.sampling_percentage,
+            random_seed=args.random_seed,
+            sitk_threads=args.sitk_threads,
+        )
+    finally:
+        _cleanup_images()

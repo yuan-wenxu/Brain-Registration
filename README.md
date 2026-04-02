@@ -1,11 +1,12 @@
-## Brain-Registration
+# Brain-Registration
 
-Four-step brain slice registration pipeline (Step1~Step4):
+Five-step brain slice registration pipeline (Step1~Step5, Step5 optional):
 
 1. Preprocessing (grayscale, resampling, tissue mask)
 2. Slice search + affine registration (to Allen Nissl)
 3. Nonlinear refinement (B-spline)
 4. Apply transforms to annotation (Allen annotation)
+5. Generate ROI masks from Step4 result (using ROI list + structure tree)
 
 Script directory: `script/`
 
@@ -16,6 +17,7 @@ Detailed technical documentation: [docs/TECHNICAL_DOCUMENTATION.md](docs/TECHNIC
 - `step2_affine.py`
 - `step3_nonlinear.py`
 - `step4_apply_label.py`
+- `step5_roi_mask.py` (optional)
 
 ---
 
@@ -60,6 +62,8 @@ Optional arguments (main entry):
 - `--search-workers`: Step2 parallel workers (recommended `2~8`)
 - `--sitk-threads`: SimpleITK thread count (use `1` for better reproducibility)
 - `--neighbor-smooth-sigma`: Step2 slice-score smoothing parameter
+- `--roi-txt-path`: Step5 ROI txt path (default uses `docs/ROI.txt` if present)
+- `--structure-tree-csv`: Step5 structure tree csv path (`structure_tree_safe_2017.csv`)
 
 ---
 
@@ -72,7 +76,8 @@ xxx_registration_result/
 ├── 01.preprocess/
 ├── 02.affine/
 ├── 03.nonlinear/
-└── 04.apply_label/
+├── 04.apply_label/
+└── 05.roi_mask/   (optional)
 ```
 
 Key outputs:
@@ -82,6 +87,8 @@ Key outputs:
 - `03.nonlinear/*_nonlinear.tif`: Step3 nonlinear result
 - `03.nonlinear/*_step3_record.json`: Step3 parameters and metrics
 - `04.apply_label/*_label.tif`: final warped annotation result
+- `05.roi_mask/*_mask.tif`: one binary mask tif per ROI (optional)
+- `05.roi_mask/roi_mask_report.csv`: ROI->id mapping and pixel statistics
 
 
 <p align="center">
@@ -96,3 +103,9 @@ Key outputs:
 <p align="center">
     <sub>Left: Nissl registration | Right: Annotation registration (click images for full size)</sub>
 </p>
+
+## Atribution
+
+This project utilizes data from the **Allen Brain Atlas**. For brain registration, we employed the Allen Mouse Brain Common Coordinate Framework (CCFv3) at a isotropic resolution of $10\,\mu m$ (Wang et al., 2020).
+- If you use the brain mapping registration function provided by this project in your research, please be sure to cite the following core references and statements in accordance with the official requirements of the Allen Institute for Brain Science.
+- Wang, Q., et al. (2020). The Allen Mouse Brain Common Coordinate Framework: A 3D Reference Atlas. Cell, 181(4), 936–953.e20. ([link](https://www.cell.com/cell/fulltext/S0092-8674(20)30402-5))
