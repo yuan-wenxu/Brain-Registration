@@ -10,7 +10,7 @@ Five-step brain slice registration pipeline (Step1~Step5, Step5 optional):
 
 Script directory: `script/`
 
-Detailed technical documentation: [docs/TECHNICAL_DOCUMENTATION.md](docs/TECHNICAL_DOCUMENTATION.md)
+Detailed technical documentation: [TECHNICAL_DOCUMENTATION.md](docs/TECHNICAL_DOCUMENTATION.md)
 
 - `run_registration_pipeline.py`: main entry (recommended)
 - `step1_preprocess.py`
@@ -35,6 +35,8 @@ Example install command (adapt to your environment manager):
 ```bash
 pip install numpy scikit-image SimpleITK matplotlib
 ```
+
+Pixi environment configuration files are also provided here.
 
 ---
 

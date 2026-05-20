@@ -180,3 +180,6 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 ROI.txt
+# pixi environments
+.pixi/*
+!.pixi/config.toml
