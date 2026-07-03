@@ -47,7 +47,7 @@ RGB grayscale conversion:
 
 ```bash
 br rgb \
-  --input-path /path/to/brain.tif \
+  --input /path/to/brain.tif \
   --rotation 0
 ```
 
@@ -55,7 +55,7 @@ Nissl stain grayscale conversion:
 
 ```bash
 br nissl \
-  --input-path /path/to/brain.tif \
+  --input /path/to/brain.tif \
   --rotation 90
 ```
 

@@ -14,11 +14,11 @@ ROTATION="0"
 usage() {
     cat <<EOF
 Usage:
-  $PROGRAM_NAME rgb|nissl --input-path /path/brain.tif [--config /path/registration.conf] [--rotation 0|90|180|270]
+  $PROGRAM_NAME rgb|nissl --input /path/brain.tif [--config /path/registration.conf] [--rotation 0|90|180|270]
 
 Required:
   rgb|nissl                         Grayscale conversion mode
-  --input-path PATH
+  --input PATH
   --config PATH                     Optional; default: config/registration.conf
   --rotation 0|90|180|270           Counterclockwise degrees; default: 0
 
@@ -43,7 +43,7 @@ fi
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --input-path) INPUT_PATH="$2"; shift 2 ;;
+        --input) INPUT_PATH="$2"; shift 2 ;;
         --config) CONFIG_PATH="$2"; shift 2 ;;
         --rotation) ROTATION="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
@@ -52,7 +52,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$INPUT_PATH" ]]; then
-    echo "--input-path is required." >&2
+    echo "--input is required." >&2
     usage >&2
     exit 2
 fi
