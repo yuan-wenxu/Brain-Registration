@@ -4,13 +4,90 @@ import random
 import csv
 import json
 import gc
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
 import numpy as np
 from skimage import io, transform, filters
 import SimpleITK as sitk
 from matplotlib import cm
 from matplotlib import pyplot as plt
+from skimage import color
 from step1_preprocess import _extract_brain_mask, _save_masked_brain_on_canvas
+from utils.registration import rigid_register, affine_register, bspline_register
+
+
+def _build_arg_parser():
+    parser = argparse.ArgumentParser(description='Step2: select the best matching atlas slice')
+    parser.add_argument(
+        '--step1-record-json',
+        required=True,
+        help='Step1 output record JSON; fixed image and mask are read automatically')
+    parser.add_argument(
+        '--moving-path',
+        required=True,
+        help='3D atlas npy path (e.g., ara_nissl_10.npy)')
+    parser.add_argument(
+        '--output-path',
+        default=None,
+        help='output directory; default: <step1-json>.parent.parent/02.select_slice')
+    parser.add_argument(
+        '--atlas-slice',
+        type=int,
+        default=None,
+        help='specify atlas slice number; if not provided, search automatically')
+    parser.add_argument(
+        '--slice-search-radius',
+        type=int,
+        default=200,
+        help='slice search radius for step2')
+    parser.add_argument(
+        '--slice-search-step',
+        type=int,
+        default=20,
+        help='slice search step for step2')
+    parser.add_argument('--search-resize-max', type=float, default=0.6, help='scale factor used to resize images during slice search')
+    parser.add_argument('--random-seed', type=int, default=42, help='random seed (for reproducible registration)')
+    parser.add_argument('--workers', type=int, default=8, help='number of slice-scoring processes working concurrently (recommended 2-8)')
+    parser.add_argument('--neighbor-smooth-sigma', type=float, default=3.0, help='sigma of Gaussian smoothing kernel used for neighbor slice score regularization')
+    return parser
+
+
+_PROCESS_WORKER_STATE = {}
+
+
+def _init_slice_worker(moving_path, fixed_search, dense_weight_map, mask_search):
+    """Initialize immutable worker data once instead of sending it per slice."""
+    global _PROCESS_WORKER_STATE
+    sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(1)
+    _PROCESS_WORKER_STATE = {
+        'atlas': np.load(str(moving_path), mmap_mode='r'),
+        'fixed_search': fixed_search,
+        'dense_weight_map': dense_weight_map,
+        'mask_search': mask_search,
+    }
+
+
+def _evaluate_slice_process(task):
+    """Process-pool entry point; must remain at module scope for spawning."""
+    idx, stage, seed, scale = task
+    state = _PROCESS_WORKER_STATE
+    moving = _normalize_01(state['atlas'][idx])
+    if scale < 1.0:
+        moving = transform.rescale(
+            moving, scale, preserve_range=True, anti_aliasing=True,
+        ).astype(np.float32)
+    else:
+        moving = moving.astype(np.float32)
+    scores = _register_rigid_affine_bspline_for_score(
+        state['fixed_search'],
+        moving,
+        idx,
+        seed=seed,
+        dense_weight_map=state['dense_weight_map'],
+        score_mask=state['mask_search'],
+    )
+    return {'slice_idx': idx, 'stage': stage, **scores}
 
 
 def _cleanup_images(*objects):
@@ -25,7 +102,7 @@ def _cleanup_images(*objects):
                 pass
     gc.collect()
 
-def _set_global_determinism(seed=2026, sitk_threads=1):
+def _set_global_determinism(seed=42, sitk_threads=1):
     np.random.seed(int(seed))
     random.seed(int(seed))
     sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(int(sitk_threads))
@@ -42,9 +119,34 @@ def _normalize_01(arr):
 def _load_fixed_2d(path):
     arr = io.imread(path)
     if arr.ndim == 3:
-        from skimage import color
         arr = color.rgb2gray(arr)
     return _normalize_01(arr)
+
+
+def _load_step1_inputs(step1_record_json):
+    record_path = Path(step1_record_json)
+    if not record_path.exists():
+        raise FileNotFoundError(f'Step1 record JSON does not exist: {record_path}')
+    with open(record_path, 'r') as f:
+        record = json.load(f)
+    outputs = record.get('outputs', {})
+    required = ('masked_canvas_path', 'mask_canvas_path')
+    missing = [key for key in required if not outputs.get(key)]
+    if missing:
+        raise ValueError(f'Step1 record JSON is missing outputs fields: {missing}')
+
+    def _resolve(path_value):
+        path = Path(path_value)
+        if not path.is_absolute() and not path.exists():
+            path = record_path.parent / path
+        return path
+
+    fixed_path = _resolve(outputs['masked_canvas_path'])
+    mask_path = _resolve(outputs['mask_canvas_path'])
+    for name, path in (('fixed image', fixed_path), ('mask', mask_path)):
+        if not path.exists():
+            raise FileNotFoundError(f'Step1 {name} does not exist: {path}')
+    return fixed_path, mask_path, record
 
 
 def _to_sitk(arr):
@@ -101,184 +203,62 @@ def _register_rigid_affine_bspline_for_score(fixed_arr, moving_arr, idx, seed=0,
         moving_arr,
         moving_mask,
         output_path=None,
+        canvas_width=fixed_arr.shape[1],
+        canvas_height=fixed_arr.shape[0],
     )
     moving = _to_sitk(moving)
 
-    rigid_init = sitk.CenteredTransformInitializer(
-        fixed, moving, sitk.Euler2DTransform(), sitk.CenteredTransformInitializerFilter.GEOMETRY
+    rigid = rigid_register(
+        fixed, moving,
+        sampling_seed=seed + 7,
+        learning_rate=0.1,
+        number_of_iterations=140,
+        shrink_factors=(4, 2, 1),
+        smoothing_sigmas=(2, 1, 0),
     )
-    reg1 = sitk.ImageRegistrationMethod()
-    reg1.SetMetricAsMattesMutualInformation(50)
-    reg1.SetMetricSamplingStrategy(reg1.RANDOM)
-    reg1.SetMetricSamplingPercentage(0.25, seed=seed + 7)
-    reg1.SetInterpolator(sitk.sitkLinear)
-    reg1.SetOptimizerAsGradientDescent(learningRate=0.1, numberOfIterations=140,
-                                       convergenceMinimumValue=1e-8, convergenceWindowSize=20)
-    reg1.SetOptimizerScalesFromPhysicalShift()
-    reg1.SetShrinkFactorsPerLevel([4, 2, 1])
-    reg1.SetSmoothingSigmasPerLevel([2, 1, 0])
-    reg1.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
-    reg1.SetInitialTransform(rigid_init, inPlace=False)
-    rigid_tx = reg1.Execute(fixed, moving)
-    rigid_tx = sitk.Euler2DTransform(rigid_tx.GetNthTransform(0))
-    rigid_mi = float(reg1.GetMetricValue())
-    rigid_iterations = int(reg1.GetOptimizerIteration())
-    rigid_stop_reason = reg1.GetOptimizerStopConditionDescription()
-
-    moving_after_rigid = sitk.Resample(moving, fixed, rigid_tx, sitk.sitkLinear, 0.0, moving.GetPixelID())
-
-    affine_tx = sitk.AffineTransform(2)
-    affine_tx.SetCenter(rigid_tx.GetCenter())
-
-    reg2 = sitk.ImageRegistrationMethod()
-    reg2.SetMetricAsMattesMutualInformation(64)
-    reg2.SetMetricSamplingStrategy(reg2.RANDOM)
-    reg2.SetMetricSamplingPercentage(0.25, seed=seed + 13)
-    reg2.SetInterpolator(sitk.sitkLinear)
-    reg2.SetOptimizerAsGradientDescent(learningRate=0.15, numberOfIterations=220,
-                                       convergenceMinimumValue=1e-8, convergenceWindowSize=20)
-    reg2.SetOptimizerScalesFromPhysicalShift()
-    reg2.SetShrinkFactorsPerLevel([4, 2, 1])
-    reg2.SetSmoothingSigmasPerLevel([2, 1, 0])
-    reg2.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
-    reg2.SetInitialTransform(affine_tx, inPlace=True)
-    affine_tx = reg2.Execute(fixed, moving_after_rigid)
-    affine_mi = float(reg2.GetMetricValue())
-    affine_iterations = int(reg2.GetOptimizerIteration())
-    affine_stop_reason = reg2.GetOptimizerStopConditionDescription()
-    moved_affine = sitk.Resample(moving_after_rigid, fixed, affine_tx, sitk.sitkLinear, 0.0, moving.GetPixelID())
-
-    bspline_init = sitk.BSplineTransformInitializer(fixed, [6, 6], order=3)
-    reg3 = sitk.ImageRegistrationMethod()
-    reg3.SetMetricAsMattesMutualInformation(64)
-    reg3.SetMetricSamplingStrategy(reg3.RANDOM)
-    reg3.SetMetricSamplingPercentage(0.2, seed=seed + 23)
-    reg3.SetInterpolator(sitk.sitkLinear)
-    reg3.SetOptimizerAsGradientDescent(learningRate=0.1, numberOfIterations=140,
-                                       convergenceMinimumValue=1e-8, convergenceWindowSize=20)
-    reg3.SetOptimizerScalesFromPhysicalShift()
-    reg3.SetShrinkFactorsPerLevel([2, 1])
-    reg3.SetSmoothingSigmasPerLevel([1, 0])
-    reg3.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
-    reg3.SetInitialTransform(bspline_init, inPlace=False)
-    bspline_tx = reg3.Execute(fixed, moved_affine)
-    bspline_mi = float(reg3.GetMetricValue())
-    bspline_iterations = int(reg3.GetOptimizerIteration())
-    bspline_stop_reason = reg3.GetOptimizerStopConditionDescription()
-
-    moved_bspline = sitk.Resample(moved_affine, fixed, bspline_tx, sitk.sitkLinear, 0.0, moved_affine.GetPixelID())
-    moved_bspline_arr = sitk.GetArrayFromImage(moved_bspline)
+    affine = affine_register(
+        fixed, rigid['image'],
+        center=rigid['transform'].GetCenter(),
+        sampling_seed=seed + 13,
+        learning_rate=0.15,
+        number_of_iterations=220,
+        shrink_factors=(4, 2, 1),
+        smoothing_sigmas=(2, 1, 0),
+    )
+    bspline = bspline_register(
+        fixed, affine['image'],
+        mesh_size=6,
+        sampling_strategy='random',
+        sampling_percentage=0.2,
+        sampling_seed=seed + 23,
+        learning_rate=0.1,
+        number_of_iterations=140,
+        shrink_factors=(2, 1),
+        smoothing_sigmas=(1, 0),
+    )
+    moved_bspline_arr = sitk.GetArrayFromImage(bspline['image'])
 
     edge_ncc = _edge_ncc(fixed_arr, moved_bspline_arr, mask=score_mask)
     if dense_weight_map is None:
         dense_weight_map = _build_dense_focus_weight(fixed_arr, percentile=85.0, gamma=2.0)
     dense_ncc = _weighted_ncc(fixed_arr.astype(np.float32), moved_bspline_arr.astype(np.float32), dense_weight_map)
 
-    score = bspline_mi - 0.12 * edge_ncc - 0.22 * dense_ncc
+    score = bspline['metric'] - 0.12 * edge_ncc - 0.22 * dense_ncc
 
     return {
-        'rigid_mi': rigid_mi,
-        'rigid_iterations': rigid_iterations,
-        'rigid_stop_reason': rigid_stop_reason,
-        'affine_mi': affine_mi,
-        'affine_iterations': affine_iterations,
-        'affine_stop_reason': affine_stop_reason,
-        'bspline_mi': bspline_mi,
-        'bspline_iterations': bspline_iterations,
-        'bspline_stop_reason': bspline_stop_reason,
+        'rigid_mi': rigid['metric'],
+        'rigid_iterations': rigid['iterations'],
+        'rigid_stop_reason': rigid['stop_reason'],
+        'affine_mi': affine['metric'],
+        'affine_iterations': affine['iterations'],
+        'affine_stop_reason': affine['stop_reason'],
+        'bspline_mi': bspline['metric'],
+        'bspline_iterations': bspline['iterations'],
+        'bspline_stop_reason': bspline['stop_reason'],
         'edge_ncc': edge_ncc,
         'dense_ncc': float(dense_ncc),
         'score': float(score),
     }
-
-
-def _final_affine_fullres(fixed_arr, moving_arr, seed=2026, fixed_mask_arr=None):
-    fixed = _to_sitk(fixed_arr)
-    moving_mask = np.ones_like(moving_arr)
-    moving, _ = _save_masked_brain_on_canvas(
-        moving_arr,
-        moving_mask,
-        output_path=None,
-    )
-    moving = _to_sitk(moving)
-
-    rigid_init = sitk.CenteredTransformInitializer(
-        fixed, moving, sitk.Euler2DTransform(), sitk.CenteredTransformInitializerFilter.GEOMETRY
-    )
-
-    reg_rigid = sitk.ImageRegistrationMethod()
-    reg_rigid.SetMetricAsMattesMutualInformation(50)
-    reg_rigid.SetMetricSamplingStrategy(reg_rigid.RANDOM)
-    reg_rigid.SetMetricSamplingPercentage(0.25, seed=int(seed) + 101)
-    reg_rigid.SetInterpolator(sitk.sitkLinear)
-    reg_rigid.SetOptimizerAsGradientDescent(learningRate=0.05, numberOfIterations=280,
-                                            convergenceMinimumValue=1e-8, convergenceWindowSize=20)
-    reg_rigid.SetOptimizerScalesFromPhysicalShift()
-    reg_rigid.SetShrinkFactorsPerLevel([8, 4, 2, 1])
-    reg_rigid.SetSmoothingSigmasPerLevel([4, 2, 1, 0])
-    reg_rigid.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
-    reg_rigid.SetInitialTransform(rigid_init, inPlace=False)
-
-    rigid_tx = reg_rigid.Execute(fixed, moving)
-    rigid_tx = sitk.Euler2DTransform(rigid_tx.GetNthTransform(0))
-    rigid_mi = float(reg_rigid.GetMetricValue())
-    rigid_iterations = int(reg_rigid.GetOptimizerIteration())
-    moving_after_rigid = sitk.Resample(moving, fixed, rigid_tx, sitk.sitkLinear, 0.0, moving.GetPixelID())
-
-    affine_tx = sitk.AffineTransform(2)
-    affine_tx.SetCenter(rigid_tx.GetCenter())
-
-    reg = sitk.ImageRegistrationMethod()
-    reg.SetMetricAsMattesMutualInformation(64)
-    reg.SetMetricSamplingStrategy(reg.RANDOM)
-    reg.SetMetricSamplingPercentage(0.25, seed=int(seed) + 131)
-    reg.SetInterpolator(sitk.sitkLinear)
-    reg.SetOptimizerAsGradientDescent(learningRate=0.05, numberOfIterations=700,
-                                      convergenceMinimumValue=1e-8, convergenceWindowSize=20)
-    reg.SetOptimizerScalesFromPhysicalShift()
-    reg.SetShrinkFactorsPerLevel([8, 4, 2, 1])
-    reg.SetSmoothingSigmasPerLevel([4, 2, 1, 0])
-    reg.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
-    reg.SetInitialTransform(affine_tx, inPlace=False)
-
-    affine_tx = reg.Execute(fixed, moving_after_rigid)
-    affine_mi = float(reg.GetMetricValue())
-    affine_iterations = int(reg.GetOptimizerIteration())
-    moved = sitk.Resample(moving_after_rigid, fixed, affine_tx, sitk.sitkLinear, 0.0, moving.GetPixelID())
-    moved_arr = sitk.GetArrayFromImage(moved)
-
-    return moved_arr, rigid_tx, affine_tx, {
-        'rigid_metric_mi': rigid_mi,
-        'rigid_iterations': rigid_iterations,
-        'rigid_stop_reason': reg_rigid.GetOptimizerStopConditionDescription(),
-        'affine_metric_mi': affine_mi,
-        'affine_iterations': affine_iterations,
-        'affine_stop_reason': reg.GetOptimizerStopConditionDescription(),
-    }
-
-
-def _gray_to_u8(arr):
-    arr = arr.astype(np.float32)
-    amin, amax = float(arr.min()), float(arr.max())
-    if amax > amin:
-        arr = (arr - amin) / (amax - amin)
-    return (np.clip(arr, 0, 1) * 255).astype(np.uint8)
-
-
-def _apply_colormap_rgb(arr, cmap_name='turbo'):
-    u8 = _gray_to_u8(arr)
-    cmap = cm.get_cmap(cmap_name)
-    rgba = cmap(u8 / 255.0)
-    rgb = (rgba[..., :3] * 255).astype(np.uint8)
-    return rgb
-
-
-def _save_overlay_rgb_tif(fixed_arr, moved_arr, output_path, alpha=0.45, cmap_name='turbo'):
-    base = _gray_to_u8(fixed_arr)
-    base_rgb = np.stack([base, base, base], axis=-1)
-    allen_rgb = _apply_colormap_rgb(moved_arr, cmap_name=cmap_name)
-    out = (base_rgb.astype(np.float32) * (1.0 - alpha) + allen_rgb.astype(np.float32) * alpha).astype(np.uint8)
-    io.imsave(output_path, out)
 
 
 def _save_weight_map_tif(weight_map, output_path):
@@ -335,12 +315,12 @@ def _save_slice_score_curve(records, output_png_path):
     x = [int(item[0]) for item in by_slice]
     raw_y = [float(item[1][1]) for item in by_slice]
     smooth_y = [float(item[1][0]) for item in by_slice]
-    plt.figure(figsize=(10, 4.8), dpi=140)
+    plt.figure(figsize=(5, 4), dpi=300)
     plt.plot(x, raw_y, color='#4f81bd', linewidth=1.4, alpha=0.75, label='raw_score')
     plt.plot(x, smooth_y, color='#c0504d', linewidth=2.0, alpha=0.95, label='smoothed_score')
-    plt.xlabel('Atlas Slice Index')
-    plt.ylabel('Score (lower is better)')
-    plt.title('Step2 Slice Score Curve')
+    plt.xlabel('Atlas Slice Index', fontsize=10)
+    plt.ylabel('Score (lower is better)', fontsize=10)
+    plt.title('Step2 Slice Score Curve', fontsize=12)
     plt.grid(True, alpha=0.25)
     plt.legend(loc='best', frameon=False)
     plt.tight_layout()
@@ -348,36 +328,34 @@ def _save_slice_score_curve(records, output_png_path):
     plt.close()
 
 
-def affine_register(
-    fixed_path,
+def select_slice(
+    step1_record_json,
     moving_path,
-    output_path,
-    mask_path=None,
+    output_path=None,
     atlas_slice=None,
     slice_search_radius=200,
     slice_search_step=20,
     search_resize_max=0.6,
-    random_seed=2026,
-    sitk_threads=1,
-    search_workers=1,
+    random_seed=42,
+    workers=1,
     neighbor_smooth_sigma=3.0,
 ):
-    workers = max(1, int(search_workers))
-    search_stage_threads = 1 if workers > 1 else int(sitk_threads)
-    _set_global_determinism(seed=random_seed, sitk_threads=search_stage_threads)
+    fixed_path, mask_path, _ = _load_step1_inputs(step1_record_json)
+    workers = max(1, int(workers))
+    _set_global_determinism(seed=random_seed, sitk_threads=1)
 
     fixed_full = _load_fixed_2d(fixed_path)
-    atlas = np.load(moving_path)
+    atlas = np.load(moving_path, mmap_mode='r')
     if atlas.ndim != 3:
         raise ValueError('moving_path must be a 3D atlas npy file')
 
     total = atlas.shape[0]
-    center =650
+    center = 650 if atlas_slice is None else int(atlas_slice)
+    center = max(0, min(total - 1, center))
 
     fixed_search = transform.rescale(fixed_full, search_resize_max, 
                                      preserve_range=True, anti_aliasing=True).astype(np.float32)
     dense_weight_full = _build_dense_focus_weight(fixed_full, percentile=85.0, gamma=2.0)
-    print(3)
 
     # load mask
     mask_search = None
@@ -410,8 +388,9 @@ def affine_register(
         dense_weight_map = dense_weight_map * mask_search
     dense_weight_map = np.clip(dense_weight_map, 0.0, 1.0)
 
-    coarse_left = max(0, center - slice_search_radius)
-    coarse_right = min(total - 1, center + slice_search_radius)
+    effective_radius = slice_search_radius if atlas_slice is None else 0
+    coarse_left = max(0, center - effective_radius)
+    coarse_right = min(total - 1, center + effective_radius)
     coarse_candidates = list(range(coarse_left, coarse_right + 1, slice_search_step))
     if center not in coarse_candidates:
         coarse_candidates.append(center)
@@ -422,6 +401,14 @@ def affine_register(
 
     records = []
     evaluated = {}
+    process_pool = None
+    if workers > 1:
+        process_pool = ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=mp.get_context('spawn'),
+            initializer=_init_slice_worker,
+            initargs=(str(moving_path), fixed_search, dense_weight_map, mask_search),
+        )
 
     def _evaluate_slice(idx, stage, seed_offset, scale):
         moving = _normalize_01(atlas[idx])
@@ -450,17 +437,28 @@ def affine_register(
                 evaluated[idx] = row
             return
 
-        max_workers = min(workers, len(pending))
-        print(f'Parallel evaluating {len(pending)} slices at stage={stage} with workers={max_workers}')
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(_evaluate_slice, idx, stage, seed_offset, scale): idx
-                for idx in pending
-            }
+        active_workers = min(workers, len(pending))
+        print(
+            f'Process-parallel evaluating {len(pending)} slices at stage={stage} '
+            f'with workers={active_workers}'
+        )
+        futures = {
+            process_pool.submit(
+                _evaluate_slice_process,
+                (idx, stage, int(random_seed) + seed_offset, scale),
+            ): idx
+            for idx in pending
+        }
+        try:
             for future in as_completed(futures):
                 row = future.result()
                 records.append(row)
                 evaluated[row['slice_idx']] = row
+        except Exception:
+            for future in futures:
+                future.cancel()
+            process_pool.shutdown(wait=True, cancel_futures=True)
+            raise
 
     _evaluate_batch(coarse_candidates, 'coarse', seed_offset=0, scale=search_resize_max)
     _apply_neighbor_score_regularization(records, neighbor_smooth_sigma=neighbor_smooth_sigma)
@@ -490,6 +488,8 @@ def affine_register(
     ultra_candidates = sorted(ultra_candidates)
     print(f'Ultra-refine candidates around best-2: n={len(ultra_candidates)}')
     _evaluate_batch(ultra_candidates, 'ultra', seed_offset=20000, scale=search_resize_max)
+    if process_pool is not None:
+        process_pool.shutdown(wait=True)
     _apply_neighbor_score_regularization(records, neighbor_smooth_sigma=neighbor_smooth_sigma)
 
     ranked_slices = _rank_slices_by_smoothed_score(records)
@@ -503,39 +503,31 @@ def affine_register(
         f'base_score={best["score"]:.6f}, bspline_mi={best["bspline_mi"]:.6f}'
     )
 
-    sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(int(sitk_threads))
-
-    moving_best_full = _normalize_01(atlas[best_slice])
-    reg_arr, rigid_tx, affine_tx, final_info = _final_affine_fullres(
-        fixed_full,
-        moving_best_full,
-        seed=int(random_seed),
-        fixed_mask_arr=mask_full if mask_search is not None else None,
+    output_path = (
+        Path(output_path)
+        if output_path is not None
+        else Path(step1_record_json).parent.parent / '02.select_slice'
     )
+    output_path.mkdir(parents=True, exist_ok=True)
+    moving_best_full = _normalize_01(atlas[best_slice])
+    selected_canvas, _ = _save_masked_brain_on_canvas(
+        moving_best_full,
+        np.ones_like(moving_best_full, dtype=bool),
+        output_path=None,
+        canvas_width=fixed_full.shape[1],
+        canvas_height=fixed_full.shape[0],
+    )
+    selected_slice_path = output_path / 'selected_slice.tif'
+    io.imsave(selected_slice_path, (np.clip(selected_canvas, 0, 1) * 65535).astype(np.uint16))
 
-    reg_u16 = (np.clip(reg_arr, 0, 1) * 65535).astype(np.uint16)
-    io.imsave(output_path, reg_u16)
-
-    merged_tx = sitk.CompositeTransform(2)
-    merged_tx.AddTransform(rigid_tx)
-    merged_tx.AddTransform(affine_tx)
-    if hasattr(merged_tx, 'FlattenTransform'):
-        merged_tx.FlattenTransform()
-    output_path = str(output_path)
-    merged_tx_path = output_path.replace('_affine.tif', '_rigid_affine.h5')
-    sitk.WriteTransform(merged_tx, merged_tx_path)
-
-    overlay_rgb_tif = output_path.replace('_affine.tif', '_overlay_on_step1_rgb.tif')
-    _save_overlay_rgb_tif(fixed_full, reg_arr, overlay_rgb_tif, alpha=0.45, cmap_name='turbo')
-
-    dense_weight_tif = output_path.replace('_affine.tif', '_dense_weight.tif')
+    dense_weight_tif = output_path / "dense_weight.tif"
     dense_weight_full = dense_weight_full * mask_full if mask_search is not None else dense_weight_full
     _save_weight_map_tif(dense_weight_full, dense_weight_tif)
 
-    slice_score_curve_png = output_path.replace('_affine.tif', '_slice_score_curve.png')
+    slice_score_curve_png = output_path / "slice_score_curve.png"
     _save_slice_score_curve(records, slice_score_curve_png)
 
-    metrics_csv = output_path.replace('_affine.tif', '_slice_search_metrics.csv')
+    metrics_csv = output_path / "slice_search_metrics.csv"
     with open(metrics_csv, 'w', newline='') as f:
         writer = csv.DictWriter(
             f,
@@ -551,9 +543,10 @@ def affine_register(
         for r in sorted(records, key=lambda x: (x['slice_idx'], x['stage'])):
             writer.writerow(r)
 
-    record_json = output_path.replace('_affine.tif', '_step2_record.json')
+    record_json = output_path / "step2_record.json"
     payload = {
         'fixed_path': str(fixed_path),
+        'step1_record_json': str(step1_record_json),
         'moving_path': str(moving_path),
         'selected_slice': best_slice,
         'search': {
@@ -565,36 +558,25 @@ def affine_register(
             'ultra_refine_radius': ultra_radius,
             'search_resize_max': search_resize_max,
             'random_seed': int(random_seed),
-            'sitk_threads': int(sitk_threads),
-            'search_workers': int(workers),
+            'workers': int(workers),
+            'parallel_backend': 'process' if workers > 1 else 'serial',
+            'worker_sitk_threads': 1,
             'coarse_candidates': coarse_candidates,
             'refine_candidates': refine_candidates,
             'ultra_candidates': ultra_candidates,
         },
         'best_candidate_metrics': best,
-        'final_rigid_metric_mi': final_info['rigid_metric_mi'],
-        'final_rigid_iterations': final_info['rigid_iterations'],
-        'final_rigid_stop_reason': final_info['rigid_stop_reason'],
-        'final_affine_metric_mi': final_info['affine_metric_mi'],
-        'final_affine_iterations': final_info['affine_iterations'],
-        'final_affine_stop_reason': final_info['affine_stop_reason'],
-        'merged_rigid_affine_transform_path': merged_tx_path,
-        'deformation_chain_forward': [
-            {'step': 'step2_rigid_affine_merged', 'transform_path': merged_tx_path, 'type': 'CompositeTransform'},
-        ],
-        'metrics_csv': metrics_csv,
-        'slice_score_curve_png': slice_score_curve_png,
-        'overlay_rgb_tif': overlay_rgb_tif,
-        'dense_weight_tif': dense_weight_tif,
+        'selected_slice_path': str(selected_slice_path),
+        'metrics_csv': str(metrics_csv),
+        'slice_score_curve_png': str(slice_score_curve_png),
+        'dense_weight_tif': str(dense_weight_tif),
     }
     with open(record_json, 'w') as f:
         json.dump(payload, f, indent=2)
 
-    print(f'Affine registered image saved to {output_path}')
-    print(f'Overlay RGB tif saved to {overlay_rgb_tif}')
+    print(f'Selected atlas slice saved to {selected_slice_path}')
     print(f'Dense weight tif saved to {dense_weight_tif}')
     print(f'Slice score curve saved to {slice_score_curve_png}')
-    print(f'Merged rigid+affine transform saved to {merged_tx_path}')
     print(f'Step2 record saved to {record_json}')
 
     _cleanup_images(
@@ -605,49 +587,26 @@ def affine_register(
         dense_weight_map,
         mask_search,
         mask_full if 'mask_full' in locals() else None,
-        reg_arr,
-        reg_u16,
+        selected_canvas,
     )
 
-    return reg_arr, affine_tx, record_json
-
-
-def _build_arg_parser():
-    parser = argparse.ArgumentParser(description='Step2: affine registration to select best matching atlas slice')
-    parser.add_argument('-f', '--fixed-path', required=True, help='fixed image path (step1 resampled output)')
-    parser.add_argument('-m', '--moving-path', required=True, help='3D atlas npy path (e.g., ara_nissl_10.npy)')
-    parser.add_argument('-o', '--output-path', required=True, help='affine registration output tif path')
-    parser.add_argument('--mask-path', default=None, help='tissue mask tif (step1 output, _mask.tif); constrains dense weight to tissue')
-    parser.add_argument('-as', '--atlas-slice', type=int, default=None, help='specify atlas slice number; if not provided, search automatically')
-    parser.add_argument('-sr', '--slice-search-radius', type=int, default=200, help='slice search radius for step2')
-    parser.add_argument('-ss', '--slice-search-step', type=int, default=20, help='slice search step for step2')
-    parser.add_argument('-sm', '--search-resize-max', type=int, default=768, help='maximum side length of images during search stage')
-    parser.add_argument('-rs', '--random-seed', type=int, default=2026, help='random seed (for reproducible registration)')
-    parser.add_argument('-st', '--sitk-threads', type=int, default=1, help='SimpleITK global thread count (recommend 1 for reproducibility)')
-    parser.add_argument('-sw', '--search-workers', type=int, default=1, help='parallel workers for slice search (recommend 2-8)')
-    parser.add_argument('--neighbor-smooth-sigma', type=float, default=3.0, help='sigma of Gaussian smoothing kernel used for neighbor slice score regularization')
-    return parser
+    return selected_canvas, best_slice, record_json
 
 
 if __name__ == '__main__':
     args = _build_arg_parser().parse_args()
-    out_dir = os.path.dirname(args.output_path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
 
     try:
-        reg_arr, affine_tx, info = affine_register(
-            fixed_path=args.fixed_path,
+        selected_arr, selected_slice, info = select_slice(
+            step1_record_json=args.step1_record_json,
             moving_path=args.moving_path,
             output_path=args.output_path,
-            mask_path=args.mask_path,
             atlas_slice=args.atlas_slice,
             slice_search_radius=args.slice_search_radius,
             slice_search_step=args.slice_search_step,
             search_resize_max=args.search_resize_max,
             random_seed=args.random_seed,
-            sitk_threads=args.sitk_threads,
-            search_workers=args.search_workers,
+            workers=args.workers,
             neighbor_smooth_sigma=args.neighbor_smooth_sigma,
         )
     finally:

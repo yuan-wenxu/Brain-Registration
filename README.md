@@ -1,113 +1,139 @@
 # Brain-Registration
 
-Five-step brain slice registration pipeline (Step1~Step5, Step5 optional):
+Register a mouse brain section to the Allen Mouse Brain Atlas, transform the Allen annotation, and optionally export ROI masks.
 
-1. Preprocessing (grayscale, resampling, tissue mask)
-2. Slice search + affine registration (to Allen Nissl)
-3. Nonlinear refinement (B-spline)
-4. Apply transforms to annotation (Allen annotation)
-5. Generate ROI masks from Step4 result (using ROI list + structure tree)
+## Install
 
-Script directory: `script/`
-
-Detailed technical documentation: [TECHNICAL_DOCUMENTATION.md](docs/TECHNICAL_DOCUMENTATION.md)
-
-- `run_registration_pipeline.py`: main entry (recommended)
-- `step1_preprocess.py`
-- `step2_affine.py`
-- `step3_nonlinear.py`
-- `step4_apply_label.py`
-- `step5_roi_mask.py` (optional)
-
----
-
-## 1. Environment
-
-Recommended: Python 3.9+ with the following dependencies:
-
-- `numpy`
-- `scikit-image`
-- `SimpleITK`
-- `matplotlib`
-
-Example install command (adapt to your environment manager):
+Install [Pixi](https://pixi.prefix.dev/) first, then run:
 
 ```bash
-pip install numpy scikit-image SimpleITK matplotlib
+pixi run init
+source ~/.bashrc
+br --help
 ```
 
-Pixi environment configuration files are also provided here.
+`pixi run init` installs the project environment and the user-level `br` command.
 
----
+## Configuration
 
-## 2. Quick Start (Recommended)
-
-Run from the project root:
+Create the local configuration from the tracked template:
 
 ```bash
-python ./script/run_registration_pipeline.py \
-	--data-path /path/to/your/whole_brain.tif \
-    --atlas-nissl /path/to/Allen_nissl_atlas \
-    --atlas-annotation  /path/to/Allen_annotation_atlas \
-    --input-res resolution (whole_brain.tif) \
-    --target-res resolution (Allen)
+cp config/registration.conf.example config/registration.conf
 ```
 
-Optional arguments (main entry):
+`config/registration.conf` is the default configuration used by `br`. Edit the configuration to set the paths and parameters for your data.
 
-- `--atlas-nissl`: Allen nissl atlas path
-- `--atlas-annotation`: Allen annotation atlas path
-- `--input-res`: input resolution
-- `--target-res`: target resolution (default: `10.0` um/px)
-- `--atlas-slice`: manually specify atlas slice (auto-search if omitted)
-- `--slice-search-radius`, `--slice-search-step`, `--search-resize-max`: Step2 search range/speed-accuracy controls
-- `--search-workers`: Step2 parallel workers (recommended `2~8`)
-- `--sitk-threads`: SimpleITK thread count (use `1` for better reproducibility)
-- `--neighbor-smooth-sigma`: Step2 slice-score smoothing parameter
-- `--roi-txt-path`: Step5 ROI txt path (default uses `docs/ROI.txt` if present)
-- `--structure-tree-csv`: Step5 structure tree csv path (`structure_tree_safe_2017.csv`)
+The configuration contains:
 
----
+- Allen Nissl atlas path
+- Allen annotation path
+- structure tree path
+- input and Allen resolutions
+- slice-selection parameters
+- registration parameters
+- optional ROI list path
 
-## 3. Output Directory Structure
+Set the ROI path to an empty string to skip Step5:
 
-For input image `xxx.tif`, outputs are generated next to it as `xxx_registration_result/`:
+```bash
+ROI_TXT_PATH=""
+```
+
+`config/ROI.txt.example` is the ROI template.
+## Usage
+
+RGB grayscale conversion:
+
+```bash
+br rgb \
+  --input-path /path/to/brain.tif \
+  --rotation 0
+```
+
+Nissl stain grayscale conversion:
+
+```bash
+br nissl \
+  --input-path /path/to/brain.tif \
+  --rotation 90
+```
+
+`--rotation` is counterclockwise and accepts `0`, `90`, `180`, or `270`. Use `--config /path/to/another.conf` to override the default configuration.
+
+## Inputs
+
+- Brain section image: TIFF or another image format supported by scikit-image.
+- Configuration file: local `config/registration.conf`, or another file supplied with `--config`.
+- Allen Nissl atlas: 3D `.npy` array converted from the official
+  [`ara_nissl_10.nrrd`](https://download.alleninstitute.org/informatics-archive/current-release/mouse_ccf/ara_nissl/ara_nissl_10.nrrd).
+- Allen CCF 2022 annotation: 3D `.npy` array converted from the official
+  [`annotation_10.nrrd`](https://download.alleninstitute.org/informatics-archive/current-release/mouse_ccf/annotation/ccf_2022/annotation_10.nrrd).
+
+Convert NRRD to NPY with the bundled script:
+
+```bash
+# single file
+pixi run python script/convert_nrrd_to_npy.py \
+  --input /path/to/ara_nissl_10.nrrd \
+  --output /path/to/ara_nissl_10.npy
+```
+- ROI text file: optional, one ROI acronym or name per line.
+- Allen 2017 structure tree CSV: required only when an ROI file is configured; [download from OSF](https://osf.io/fv7ed/files/osfstorage). The 2017 structure hierarchy is used with the 2020 atlas volumes.
+
+## Outputs
+
+When `OUTPUT_PATH` is empty, output directories are created beside the input image:
 
 ```text
-xxx_registration_result/
-├── 01.preprocess/
-├── 02.affine/
-├── 03.nonlinear/
-├── 04.apply_label/
-└── 05.roi_mask/   (optional)
+01.preprocess/
+02.select_slice/
+03.registration/
+04.apply_label/
+05.roi_mask/        # only when ROI_TXT_PATH is configured
 ```
 
-Key outputs:
+Main outputs:
 
-- `02.affine/*_affine.tif`: Step2 affine result
-- `02.affine/*_step2_record.json`: Step2 parameters and metrics
-- `03.nonlinear/*_nonlinear.tif`: Step3 nonlinear result
-- `03.nonlinear/*_step3_record.json`: Step3 parameters and metrics
-- `04.apply_label/*_label.tif`: final warped annotation result
-- `05.roi_mask/*_mask.tif`: one binary mask tif per ROI (optional)
-- `05.roi_mask/roi_mask_report.csv`: ROI->id mapping and pixel statistics
+```text
+01.preprocess/
+  *_gray.tif
+  *_resampled.tif
+  *_mask.tif
+  *_masked_on_1140x800_black.tif
+  *_step1_record.json
 
+02.select_slice/
+  selected_slice.tif
+  slice_search_metrics.csv
+  slice_score_curve.png
+  step2_record.json
 
-<p align="center">
-    <a href="docs/image/03.nonlinear/test.png">
-        <img src="docs/image/03.nonlinear/test.png" alt="Nissl registration" width="49%" />
-    </a>
-    <a href="docs/image/04.apply_label/test.png">
-        <img src="docs/image/04.apply_label/test.png" alt="Annotation registration" width="49%" />
-    </a>
-</p>
+03.registration/
+  *_rigid.tif
+  *_affine.tif
+  *_registration.tif
+  *_registration.h5
+  *_metric_history.csv
+  *_step3_record.json
 
-<p align="center">
-    <sub>Left: Nissl registration | Right: Annotation registration (click images for full size)</sub>
-</p>
+04.apply_label/
+  *_label.tif
+  *_overlay.tif
+  *_region_distribution.csv
+  *_step4_record.json
 
-## Atribution
+05.roi_mask/
+  *_mask.tif
+  *_mask_fullres_gray.png
+  roi_mask_report.csv
+  step5_record.json
+```
 
-This project utilizes data from the **Allen Brain Atlas**. For brain registration, we employed the Allen Mouse Brain Common Coordinate Framework (CCFv3) at a isotropic resolution of $10\,\mu m$ (Wang et al., 2020).
-- If you use the brain mapping registration function provided by this project in your research, please be sure to cite the following core references and statements in accordance with the official requirements of the Allen Institute for Brain Science.
-- Wang, Q., et al. (2020). The Allen Mouse Brain Common Coordinate Framework: A 3D Reference Atlas. Cell, 181(4), 936–953.e20. ([link](https://www.cell.com/cell/fulltext/S0092-8674(20)30402-5))
+Each step writes a JSON record used automatically by the next step.
+
+## Citation
+
+This project uses the Allen Mouse Brain Common Coordinate Framework. Please cite:
+
+Wang, Q., et al. (2020). *The Allen Mouse Brain Common Coordinate Framework: A 3D Reference Atlas*. Cell, 181(4), 936–953.e20.

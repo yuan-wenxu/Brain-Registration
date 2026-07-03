@@ -3,9 +3,18 @@ import argparse
 import csv
 import json
 import gc
+from pathlib import Path
 import numpy as np
 import SimpleITK as sitk
 from skimage import io
+
+
+def _build_arg_parser():
+    parser = argparse.ArgumentParser(description='Step4: apply the Step3 transform to atlas annotation')
+    parser.add_argument('--label-path', required=True, help='atlas annotation path, e.g. annotation_10.npy')
+    parser.add_argument('--step3-record-json', required=True, help='Step3 record JSON; previous paths are read automatically')
+    parser.add_argument('--output-path', default=None, help='output directory; default: <step3-json>.parent.parent/04.apply_label directory')
+    return parser
 
 
 def _cleanup_images(*objects):
@@ -22,7 +31,8 @@ def _cleanup_images(*objects):
 
 
 def _load_label_image(label_path, atlas_slice=None):
-    if label_path.endswith('.npy'):
+    label_path = Path(label_path)
+    if label_path.suffix.lower() == '.npy':
         arr = np.load(label_path)
         if arr.ndim == 3:
             idx = arr.shape[0] // 2 if atlas_slice is None else int(atlas_slice)
@@ -31,12 +41,13 @@ def _load_label_image(label_path, atlas_slice=None):
         image = sitk.GetImageFromArray(arr.astype(np.uint16))
         image.SetSpacing([1.0, 1.0])
     else:
-        image = sitk.ReadImage(label_path, sitk.sitkUInt16)
+        image = sitk.ReadImage(str(label_path), sitk.sitkUInt16)
     return image
 
 
 def _load_nissl_image(nissl_path, atlas_slice=None):
-    if nissl_path.endswith('.npy'):
+    nissl_path = Path(nissl_path)
+    if nissl_path.suffix.lower() == '.npy':
         arr = np.load(nissl_path)
         if arr.ndim == 3:
             idx = arr.shape[0] // 2 if atlas_slice is None else int(atlas_slice)
@@ -49,11 +60,11 @@ def _load_nissl_image(nissl_path, atlas_slice=None):
         image = sitk.GetImageFromArray(arr)
         image.SetSpacing([1.0, 1.0])
     else:
-        image = sitk.ReadImage(nissl_path, sitk.sitkFloat32)
+        image = sitk.ReadImage(str(nissl_path), sitk.sitkFloat32)
     return image
 
 
-def _place_on_canvas(arr, tissue_mask, canvas_width=1100, canvas_height=800, is_label=False):
+def _place_on_canvas(arr, tissue_mask, canvas_width=1140, canvas_height=800, is_label=False):
     masked = arr.astype(np.float32) * tissue_mask.astype(np.float32)
     nz = np.argwhere(tissue_mask)
     canvas = np.zeros((canvas_height, canvas_width), dtype=np.float32)
@@ -68,20 +79,15 @@ def _place_on_canvas(arr, tissue_mask, canvas_width=1100, canvas_height=800, is_
 
     ch, cw = crop.shape
     mask_crop = (mask_crop > 0.5).astype(np.float32)
+    if ch > canvas_height or cw > canvas_width:
+        raise ValueError(
+            f'Atlas slice {cw}x{ch} exceeds canvas {canvas_width}x{canvas_height}; '
+            'automatic canvas scaling is disabled'
+        )
 
-    copy_h = min(ch, canvas_height)
-    copy_w = min(cw, canvas_width)
-    if copy_h <= 0 or copy_w <= 0:
-        return canvas.astype(np.uint16 if is_label else np.float32)
-
-    src_top = max(0, (ch - copy_h) // 2)
-    src_left = max(0, (cw - copy_w) // 2)
-    dst_top = max(0, (canvas_height - copy_h) // 2)
-    dst_left = max(0, (canvas_width - copy_w) // 2)
-
-    crop_view = crop[src_top:src_top + copy_h, src_left:src_left + copy_w]
-    mask_view = mask_crop[src_top:src_top + copy_h, src_left:src_left + copy_w]
-    canvas[dst_top:dst_top + copy_h, dst_left:dst_left + copy_w] = crop_view * mask_view
+    top = max(0, (canvas_height - ch) // 2)
+    left = max(0, (canvas_width - cw) // 2)
+    canvas[top:top + ch, left:left + cw] = crop * mask_crop
 
     if is_label:
         return np.rint(np.clip(canvas, 0, np.iinfo(np.uint16).max)).astype(np.uint16)
@@ -148,39 +154,77 @@ def _resample_once_with_composite(image, reference, transform_paths, interpolato
     return sitk.Resample(image, reference, merged, interpolator, fill_value, image.GetPixelID())
 
 
+def _load_step3_inputs(step3_record_json, output_path=None):
+    step3_path = Path(step3_record_json)
+    if not step3_path.exists():
+        raise FileNotFoundError(f'Step3 record JSON does not exist: {step3_path}')
+    with open(step3_path, 'r') as f:
+        step3 = json.load(f)
+
+    def _resolve(path_value, label, base_dir=None):
+        if not path_value:
+            raise ValueError(f'Step3 record JSON is missing {label}')
+        path = Path(path_value)
+        if not path.is_absolute() and not path.exists():
+            path = (base_dir or step3_path.parent) / path
+        if not path.exists():
+            raise FileNotFoundError(f'{label} does not exist: {path}')
+        return path
+
+    step2_path = _resolve(step3.get('step2_record_json'), 'step2_record_json')
+    with open(step2_path, 'r') as f:
+        step2 = json.load(f)
+    reference_path = _resolve(step3.get('fixed_path'), 'fixed_path')
+    nissl_path = _resolve(step3.get('adjusted_allen_gray_tif'), 'adjusted_allen_gray_tif')
+
+    step1_path_value = step2.get('step1_record_json')
+    sample_name = reference_path.stem
+    if step1_path_value:
+        step1_path = Path(step1_path_value)
+        if not step1_path.is_absolute() and not step1_path.exists():
+            step1_path = step2_path.parent / step1_path
+        if step1_path.exists():
+            with open(step1_path, 'r') as f:
+                step1 = json.load(f)
+            if step1.get('input_path'):
+                sample_name = Path(step1['input_path']).stem
+
+    output_dir = (
+        Path(output_path)
+        if output_path is not None
+        else step3_path.parent.parent / '04.apply_label'
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        'step2_record_json': step2_path,
+        'reference_path': reference_path,
+        'nissl_path': nissl_path,
+        'output_path': output_dir / f'{sample_name}_label.tif',
+    }
+
+
 def apply_transform_to_label(
     label_path,
-    reference_path,
-    output_path,
-    atlas_slice=None,
-    step2_record_json=None,
-    step3_record_json=None,
-    nissl_path=None,
+    step3_record_json,
+    output_path=None,
 ):
     """strict apply deformation chain to atlas annotation, with optional nissl output and stats report
 
     parameters:
     ----
-    step2_record_json: step2_affine.py output record json
-    step3_record_json: step3_nonlinear.py output record json
+    step3_record_json: step3_registration.py output record JSON. Step2 and image paths are resolved from it.
     """
 
-    step2_chain = []
+    paths = _load_step3_inputs(step3_record_json, output_path=output_path)
+    step2_record_json = paths['step2_record_json']
+    reference_path = paths['reference_path']
+    nissl_path = paths['nissl_path']
+    output_path = paths['output_path']
+
     if step2_record_json is not None and os.path.exists(str(step2_record_json)):
         with open(step2_record_json, 'r') as f:
             s2 = json.load(f)
-        selected_slice = int(s2['selected_slice'])
-        if atlas_slice is None:
-            atlas_slice = selected_slice
-        elif int(atlas_slice) != selected_slice:
-            raise ValueError(
-                f'atlas_slice({atlas_slice}) is different from step2 selected_slice({selected_slice}), please check your inputs'
-            )
-        if s2.get('deformation_chain_forward'):
-            step2_chain = [x['transform_path'] for x in s2['deformation_chain_forward']]
-        elif s2.get('merged_rigid_affine_transform_path'):
-            step2_chain = [s2['merged_rigid_affine_transform_path']]
-
+        atlas_slice = int(s2['selected_slice'])
 
     step3_chain = []
     if step3_record_json is not None and os.path.exists(str(step3_record_json)):
@@ -191,7 +235,7 @@ def apply_transform_to_label(
         elif s3.get('transform_path'):
             step3_chain = [s3['transform_path']]
 
-    full_chain_forward = step2_chain + step3_chain
+    full_chain_forward = step3_chain
     print(f'Deformation chain ({len(full_chain_forward)} transforms):')
     for p in full_chain_forward:
         if not os.path.exists(p):
@@ -200,7 +244,7 @@ def apply_transform_to_label(
 
     reference = sitk.ReadImage(reference_path, sitk.sitkFloat32)
 
-    # ---- load reference ----
+    # load reference
     label = _load_label_image(label_path, atlas_slice=atlas_slice)
     label_arr = sitk.GetArrayFromImage(label).astype(np.uint16)
     label_mask = np.ones_like(label_arr, dtype=np.uint8)
@@ -214,7 +258,7 @@ def apply_transform_to_label(
     label = sitk.GetImageFromArray(label_canvas_arr)
     label.SetSpacing([1.0, 1.0])
 
-    # ---- load and apply transforms ----
+    # load and apply transforms
     warped_label = _resample_once_with_composite(
         label, reference, full_chain_forward,
         interpolator=sitk.sitkNearestNeighbor, fill_value=0.0,
@@ -227,7 +271,7 @@ def apply_transform_to_label(
     io.imsave(output_path, _label_to_color_rgb(warped_arr))
     _save_label_overlay_tif(ref_arr, warped_arr, overlay_rgb_tif, alpha=0.45)
 
-    # ---- option nissl tif processing ----
+    # option nissl tif processing
     warped_nissl_tif = None
     annotation_nissl_merge_tif = None
     if nissl_path is not None:
@@ -250,7 +294,6 @@ def apply_transform_to_label(
         'atlas_slice': atlas_slice,
         'step2_record_json': str(step2_record_json),
         'step3_record_json': str(step3_record_json),
-        'step2_chain': step2_chain,
         'step3_chain': step3_chain,
         'applied_deformation_chain_forward': full_chain_forward,
         'label_rgb_tif': str(output_path),
@@ -284,33 +327,14 @@ def apply_transform_to_label(
     return warped_label
 
 
-def _build_arg_parser():
-    parser = argparse.ArgumentParser(description='Step4: apply deformation chain to atlas annotation, with optional nissl output and stats report')
-    parser.add_argument('--label-path', required=True, help='atlas annotation path (e.g. annotation_10.npy or annotation_10.tif)')
-    parser.add_argument('--reference-path', required=True, help='reference image path (e.g. step1_resampled.tif)')
-    parser.add_argument('--output-path', required=True, help='output path for the warped label')
-    parser.add_argument('--atlas-slice', type=int, default=None, help='atlas slice number; can be left empty to infer from step2 record')
-    parser.add_argument('--step2-record-json', default=None, help='step2 record json path (_step2_record.json)')
-    parser.add_argument('--step3-record-json', default=None, help='step3 record json path (_step3_record.json)')
-    parser.add_argument('--nissl-path', default=None, help='ara_nissl_10.npy path (optional)')
-    return parser
-
-
 if __name__ == '__main__':
     args = _build_arg_parser().parse_args()
-    out_dir = os.path.dirname(args.output_path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
 
     try:
         apply_transform_to_label(
             label_path=args.label_path,
-            reference_path=args.reference_path,
             output_path=args.output_path,
-            atlas_slice=args.atlas_slice,
-            step2_record_json=args.step2_record_json,
             step3_record_json=args.step3_record_json,
-            nissl_path=args.nissl_path,
         )
     finally:
         _cleanup_images()

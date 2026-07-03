@@ -1,0 +1,5 @@
+# One Allen structure acronym per line.
+# Parent structures include all descendants in the generated mask.
+PVH
+VMH
+ARH

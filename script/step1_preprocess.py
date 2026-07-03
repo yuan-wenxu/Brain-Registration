@@ -1,15 +1,62 @@
 import PIL.Image
 PIL.Image.MAX_IMAGE_PIXELS = None
 
-import os
 import argparse
 import json
 import gc
+from pathlib import Path
 import numpy as np
 from skimage import io, transform, color, measure
 from skimage.filters import threshold_otsu, gaussian
 from skimage import morphology
-from scipy.ndimage import binary_fill_holes
+from scipy.ndimage import binary_fill_holes, gaussian_filter1d
+from scipy.signal import find_peaks
+
+
+CANVAS_WIDTH = 1140
+CANVAS_HEIGHT = 800
+
+
+def _build_arg_parser():
+    parser = argparse.ArgumentParser(
+        description='Step1: preprocess brain slice image',
+        add_help=False,
+    )
+    parser.add_argument('--help', action='help', help='show this help message and exit')
+    parser.add_argument('--input-path', required=True, help='input image path')
+    parser.add_argument(
+        '--output-path',
+        default=None,
+        help='output directory; default: <input directory>/01.preprocess',
+    )
+    parser.add_argument('--input-res', type=float, default=0.294, help='input resolution (um/px)')
+    parser.add_argument('--target-res', type=float, default=10.0, help='target resolution (um/px)')
+    parser.add_argument(
+        '--grayscale-mode',
+        choices=('nissl', 'rgb'),
+        default='rgb',
+        help='RGB grayscale conversion: stain optical density or standard luminance (default: rgb)',
+    )
+    parser.add_argument(
+        '--rotation',
+        type=int,
+        choices=(0, 90, 180, 270),
+        default=0,
+        help='counterclockwise input rotation in degrees (default: 0)',
+    )
+    parser.add_argument(
+        '--brain-layout',
+        choices=('auto', 'whole', 'left', 'right'),
+        default='auto',
+        help='brain tissue layout; half brains are aligned by their medial edge (default: auto)',
+    )
+    parser.add_argument(
+        '--replace-background-values',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='remove white-gray mosaic background by replacing uint8 values 255 and 204 with zero (default: enabled)',
+    )
+    return parser
 
 
 def _cleanup_images(*objects):
@@ -48,6 +95,60 @@ def _replace_background_values(img_arr):
             img_arr[hit] = 0
 
     return img_arr, replaced_pixels
+
+
+def _normalize_gray(gray):
+    gray = gray.astype(np.float32)
+    finite = np.isfinite(gray)
+    if not np.any(finite):
+        return np.zeros_like(gray, dtype=np.float32)
+    low = float(np.min(gray[finite]))
+    high = float(np.max(gray[finite]))
+    if high > low:
+        gray = (gray - low) / (high - low)
+    else:
+        gray = np.zeros_like(gray, dtype=np.float32)
+    return np.clip(gray, 0.0, 1.0)
+
+
+def _nissl_rgb_to_gray(img_arr):
+    """Extract purple-blue Nissl stain concentration in optical-density space."""
+    rgb = img_arr[..., :3].astype(np.float32)
+    if np.issubdtype(img_arr.dtype, np.integer):
+        rgb /= float(np.iinfo(img_arr.dtype).max)
+    else:
+        max_value = float(np.nanmax(rgb)) if rgb.size else 1.0
+        if max_value > 1.0:
+            rgb /= max_value
+    rgb = np.clip(rgb, 0.0, 1.0)
+
+    # Exclude black canvas/mosaic pixels: black in RGB is not Nissl stain.
+    valid = np.max(rgb, axis=2) > 0.02
+    optical_density = -np.log(np.clip(rgb, 1.0 / 255.0, 1.0))
+    # A normalized purple-blue nuclear/Nissl stain direction.
+    stain_vector = np.array([0.65, 0.70, 0.29], dtype=np.float32)
+    stain_vector /= np.linalg.norm(stain_vector)
+    concentration = np.sum(optical_density * stain_vector, axis=2)
+    concentration[~valid] = 0.0
+
+    tissue_values = concentration[valid & np.isfinite(concentration)]
+    if tissue_values.size:
+        low, high = np.percentile(tissue_values, [1.0, 99.0])
+        if high > low:
+            concentration = (concentration - float(low)) / float(high - low)
+    concentration = np.clip(concentration, 0.0, 1.0)
+    concentration[~valid] = 0.0
+    return concentration.astype(np.float32)
+
+
+def _convert_to_gray(img_arr, grayscale_mode='rgb'):
+    if img_arr.ndim != 3:
+        return _normalize_gray(img_arr)
+    if grayscale_mode == 'nissl':
+        return _nissl_rgb_to_gray(img_arr)
+    if grayscale_mode == 'rgb':
+        return color.rgb2gray(img_arr[..., :3]).astype(np.float32)
+    raise ValueError('grayscale_mode must be one of: nissl, rgb')
 
 
 def _extract_brain_mask(gray_resampled):
@@ -114,13 +215,199 @@ def _extract_brain_mask(gray_resampled):
     return mask.astype(bool)
 
 
+def _infer_brain_layout(tissue_mask):
+    """Infer whether a mask is a whole brain or a left/right hemisphere.
+
+    A hemisected brain usually has one nearly straight vertical medial edge.
+    """
+    nz = np.argwhere(tissue_mask)
+    if nz.size == 0:
+        return 'whole', {'reason': 'empty_mask'}
+
+    r0, c0 = nz.min(axis=0)
+    r1, c1 = nz.max(axis=0)
+    crop = tissue_mask[r0:r1 + 1, c0:c1 + 1]
+    rows = np.flatnonzero(crop.any(axis=1))
+    if rows.size < 20:
+        return 'whole', {'reason': 'insufficient_rows'}
+
+    # Ignore curved superior/inferior tips and assess the central 70% of rows.
+    lo = int(rows.size * 0.15)
+    hi = max(lo + 1, int(rows.size * 0.85))
+    rows = rows[lo:hi]
+    left_edges = np.array([np.flatnonzero(crop[r])[0] for r in rows], dtype=np.float32)
+    right_edges = np.array([np.flatnonzero(crop[r])[-1] for r in rows], dtype=np.float32)
+
+    def _straightness(edge):
+        x = np.arange(edge.size, dtype=np.float32)
+        trend = np.polyval(np.polyfit(x, edge, 1), x)
+        return float(np.median(np.abs(edge - trend)))
+
+    left_score = _straightness(left_edges)
+    right_score = _straightness(right_edges)
+    width = max(1, int(c1 - c0 + 1))
+    straight_threshold = max(2.0, width * 0.025)
+    confidence_ratio = 0.6
+
+    if right_score <= straight_threshold and right_score < left_score * confidence_ratio:
+        layout = 'left'
+    elif left_score <= straight_threshold and left_score < right_score * confidence_ratio:
+        layout = 'right'
+    else:
+        layout = 'whole'
+    return layout, {
+        'left_edge_straightness': left_score,
+        'right_edge_straightness': right_score,
+        'straightness_threshold': float(straight_threshold),
+    }
+
+
+def _estimate_anatomical_midline(tissue_mask, brain_layout='whole'):
+    """Estimate the midline by local mirror symmetry around a dorsal valley."""
+    nz = np.argwhere(tissue_mask)
+    if nz.size == 0:
+        return None, {'confident': False, 'reason': 'empty_mask'}
+    r0, c0 = nz.min(axis=0)
+    r1, c1 = nz.max(axis=0)
+    crop = tissue_mask[r0:r1 + 1, c0:c1 + 1].astype(bool)
+    h, w = crop.shape
+    if h < 20 or w < 20:
+        return None, {'confident': False, 'reason': 'mask_too_small'}
+
+    valid = crop.any(axis=0)
+    top = np.full(w, np.nan, dtype=np.float32)
+    for col in np.flatnonzero(valid):
+        top[col] = float(np.flatnonzero(crop[:, col])[0])
+    valid_cols = np.flatnonzero(valid)
+    top = np.interp(np.arange(w), valid_cols, top[valid_cols]).astype(np.float32)
+
+    # A geometrically low point on the dorsal contour has a larger row coordinate.
+    smooth_top = gaussian_filter1d(top, sigma=max(1.0, w * 0.01), mode='nearest')
+    min_valley_depth = max(2.0, h * 0.025)
+    valley_indices, _ = find_peaks(
+        smooth_top,
+        distance=max(5, int(w * 0.08)),
+        prominence=min_valley_depth,
+    )
+    valley_indices = valley_indices[
+        (valley_indices >= int(w * 0.08)) & (valley_indices <= int(w * 0.92))
+    ]
+    min_compare_length = max(6, int(w * 0.06))
+    max_compare_length = max(min_compare_length, int(w * 0.25))
+    max_symmetry_mae = max(2.0, h * 0.04)
+
+    if brain_layout == 'right':
+        ordered_valleys = sorted(int(x) for x in valley_indices)
+    elif brain_layout == 'left':
+        ordered_valleys = sorted((int(x) for x in valley_indices), reverse=True)
+    else:
+        ordered_valleys = [int(x) for x in valley_indices]
+
+    accepted = []
+    for valley_col in ordered_valleys:
+        compare_length = min(valley_col, w - valley_col - 1, max_compare_length)
+        if compare_length < min_compare_length:
+            continue
+        left_profile = smooth_top[valley_col - compare_length:valley_col][::-1]
+        right_profile = smooth_top[valley_col + 1:valley_col + 1 + compare_length]
+
+        # Compare shapes relative to the valley height, not their absolute image rows.
+        valley_height = float(smooth_top[valley_col])
+        left_relative = left_profile - valley_height
+        right_relative = right_profile - valley_height
+        symmetry_mae = float(np.mean(np.abs(left_relative - right_relative)))
+        left_depth = float(valley_height - np.min(left_profile))
+        right_depth = float(valley_height - np.min(right_profile))
+        bilateral_depth = min(left_depth, right_depth)
+        if symmetry_mae > max_symmetry_mae or bilateral_depth < min_valley_depth:
+            continue
+        accepted.append({
+            'valley_col': valley_col,
+            'compare_length': int(compare_length),
+            'symmetry_mae': symmetry_mae,
+            'left_depth': left_depth,
+            'right_depth': right_depth,
+            'bilateral_depth': bilateral_depth,
+            'score': bilateral_depth - symmetry_mae,
+        })
+        # For a known dominant hemisphere, traversal order is part of the method.
+        if brain_layout in ('left', 'right'):
+            break
+
+    if not accepted:
+        return None, {
+            'confident': False,
+            'reason': 'no_locally_symmetric_dorsal_valley',
+            'brain_layout': str(brain_layout),
+            'detected_valley_cols_in_bbox': [int(x) for x in valley_indices],
+            'min_compare_length': int(min_compare_length),
+            'max_compare_length': int(max_compare_length),
+            'max_symmetry_mae': float(max_symmetry_mae),
+            'min_valley_depth': float(min_valley_depth),
+        }
+    best = accepted[0] if brain_layout in ('left', 'right') else max(
+        accepted, key=lambda item: item['score']
+    )
+    local_col = best['valley_col']
+
+    left_area = int(np.count_nonzero(crop[:, :local_col]))
+    right_area = int(np.count_nonzero(crop[:, local_col + 1:]))
+    total_area = max(1, left_area + right_area)
+    smaller_side_fraction = min(left_area, right_area) / total_area
+    confident = bool(smaller_side_fraction >= 0.03)
+    diagnostics = {
+        'confident': confident,
+        'method': 'local_mirror_symmetry_around_dorsal_valley',
+        'brain_layout': str(brain_layout),
+        'midline_col_in_bbox': local_col,
+        'midline_col_in_image': int(c0 + local_col),
+        'compare_length': best['compare_length'],
+        'symmetry_mae': best['symmetry_mae'],
+        'max_symmetry_mae': float(max_symmetry_mae),
+        'left_valley_depth': best['left_depth'],
+        'right_valley_depth': best['right_depth'],
+        'bilateral_valley_depth': best['bilateral_depth'],
+        'min_valley_depth': float(min_valley_depth),
+        'smaller_side_fraction': float(smaller_side_fraction),
+    }
+    return (int(c0 + local_col) if confident else None), diagnostics
+
+
+def _canvas_position(
+    mask_crop,
+    canvas_height,
+    canvas_width,
+    brain_layout,
+    midline_col_in_crop=None,
+):
+    ch, cw = mask_crop.shape
+    top = max(0, (canvas_height - ch) // 2)
+    if midline_col_in_crop is not None:
+        medial_col = float(midline_col_in_crop)
+        left = canvas_width // 2 - medial_col
+    elif brain_layout == 'left':
+        row_edges = [np.flatnonzero(row)[-1] for row in mask_crop if row.any()]
+        medial_col = int(np.median(row_edges))
+        left = canvas_width // 2 - medial_col
+    elif brain_layout == 'right':
+        row_edges = [np.flatnonzero(row)[0] for row in mask_crop if row.any()]
+        medial_col = int(np.median(row_edges))
+        left = canvas_width // 2 - medial_col
+    else:
+        left = (canvas_width - cw) // 2
+    left = int(round(min(max(0, left), max(0, canvas_width - cw))))
+    return top, left
+
+
 def _save_masked_brain_on_canvas(
     gray_resampled,
     tissue_mask,
     output_path,
-    canvas_width=1100,
-    canvas_height=800,
+    canvas_width=CANVAS_WIDTH,
+    canvas_height=CANVAS_HEIGHT,
     mask_canvas_output_path=None,
+    brain_layout='whole',
+    anatomical_midline_col=None,
 ):
     masked = gray_resampled.astype(np.float32) * tissue_mask.astype(np.float32)
     nz = np.argwhere(tissue_mask)
@@ -140,21 +427,23 @@ def _save_masked_brain_on_canvas(
     mask_crop = tissue_mask[r0:r1 + 1, c0:c1 + 1].astype(np.float32)
 
     ch, cw = crop.shape
-    scale = min(1.0, float(canvas_height) / max(ch, 1), float(canvas_width) / max(cw, 1))
-    if scale < 1.0:
-        crop = transform.rescale(crop, scale, preserve_range=True, anti_aliasing=True).astype(np.float32)
-        mask_crop = transform.rescale(
-            mask_crop,
-            scale,
-            order=0,
-            preserve_range=True,
-            anti_aliasing=False,
-        ).astype(np.float32)
-        ch, cw = crop.shape
+    if ch > canvas_height or cw > canvas_width:
+        raise ValueError(
+            f'Tissue crop {cw}x{ch} exceeds canvas {canvas_width}x{canvas_height}; '
+            'automatic canvas scaling is disabled'
+        )
     mask_crop = (mask_crop > 0.5).astype(np.uint8)
 
-    top = max(0, (canvas_height - ch) // 2)
-    left = max(0, (canvas_width - cw) // 2)
+    midline_col_in_crop = None
+    if anatomical_midline_col is not None:
+        midline_col_in_crop = float(anatomical_midline_col) - float(c0)
+    top, left = _canvas_position(
+        mask_crop,
+        canvas_height,
+        canvas_width,
+        brain_layout,
+        midline_col_in_crop=midline_col_in_crop,
+    )
     canvas[top:top + ch, left:left + cw] = crop
     mask_canvas[top:top + ch, left:left + cw] = (mask_crop * 255).astype(np.uint8)
 
@@ -172,8 +461,10 @@ def _save_fullres_canvas(
     tissue_mask_downsampled,
     downsampled_shape,
     output_path,
-    canvas_width=1100,
-    canvas_height=800,
+    canvas_width=CANVAS_WIDTH,
+    canvas_height=CANVAS_HEIGHT,
+    brain_layout='whole',
+    anatomical_midline_col=None,
 ):
     """Generate canvas at original resolution using the downsampled mask.
     
@@ -205,13 +496,26 @@ def _save_fullres_canvas(
     crop = masked[r0:r1 + 1, c0:c1 + 1]
     
     ch, cw = crop.shape
-    scale = min(1.0, float(fullres_canvas_h) / max(ch, 1), float(fullres_canvas_w) / max(cw, 1))
-    if scale < 1.0:
-        crop = transform.rescale(crop, scale, preserve_range=True, anti_aliasing=True).astype(np.float32)
-        ch, cw = crop.shape
+    if ch > fullres_canvas_h or cw > fullres_canvas_w:
+        raise ValueError(
+            f'Full-resolution tissue crop {cw}x{ch} exceeds canvas '
+            f'{fullres_canvas_w}x{fullres_canvas_h}; automatic canvas scaling is disabled'
+        )
+    midline_col_fullres = None
+    if anatomical_midline_col is not None:
+        midline_col_fullres = float(anatomical_midline_col) / float(scale_factor[1])
     
-    top = max(0, (fullres_canvas_h - ch) // 2)
-    left = max(0, (fullres_canvas_w - cw) // 2)
+    mask_crop = tissue_mask_fullres[r0:r1 + 1, c0:c1 + 1]
+    midline_col_in_crop = None
+    if anatomical_midline_col is not None:
+        midline_col_in_crop = midline_col_fullres - float(c0)
+    top, left = _canvas_position(
+        mask_crop,
+        fullres_canvas_h,
+        fullres_canvas_w,
+        brain_layout,
+        midline_col_in_crop=midline_col_in_crop,
+    )
     canvas[top:top + ch, left:left + cw] = crop
     
     canvas_u16 = (np.clip(canvas, 0, 1) * 65535).astype(np.uint16)
@@ -228,6 +532,10 @@ def preprocess_image(
     mask_output_path,
     input_res=0.294,
     target_res=10.0,
+    replace_background_values=True,
+    rotation=0,
+    brain_layout='auto',
+    grayscale_mode='rgb',
 ):
     """
     Step1: gray image + resample
@@ -236,19 +544,26 @@ def preprocess_image(
     """
     print(f'Loading {input_path} ...')
     img_arr = io.imread(input_path)
+    original_input_shape = img_arr.shape
     print(f'Shape: {img_arr.shape}, dtype: {img_arr.dtype}')
 
-    img_arr, replaced_pixels = _replace_background_values(img_arr)
-    if replaced_pixels > 0:
-        print(f'Background cleanup: replaced {replaced_pixels} pixels of (255,255,255)/(204,204,204) to black')
+    if rotation not in (0, 90, 180, 270):
+        raise ValueError('rotation must be one of: 0, 90, 180, 270')
+    if rotation:
+        img_arr = np.rot90(img_arr, k=rotation // 90)
+        print(f'Input rotated {rotation} degrees counterclockwise; shape: {img_arr.shape}')
 
-    if img_arr.ndim == 3:
-        gray = color.rgb2gray(img_arr).astype(np.float32)
-    else:
-        gray = img_arr.astype(np.float32)
-        maxv = float(gray.max())
-        if maxv > 1.0:
-            gray = gray / maxv
+    replaced_pixels = 0
+    if replace_background_values:
+        img_arr, replaced_pixels = _replace_background_values(img_arr)
+        if replaced_pixels > 0:
+            print(
+                f'White-gray mosaic background cleanup: replaced {replaced_pixels} pixels '
+                'of (255,255,255)/(204,204,204) with black'
+            )
+
+    gray = _convert_to_gray(img_arr, grayscale_mode=grayscale_mode)
+    print(f'Grayscale conversion mode: {grayscale_mode}')
 
     gray_u16 = (np.clip(gray, 0, 1) * 65535).astype(np.uint16)
     io.imsave(gray_output_path, gray_u16)
@@ -265,15 +580,48 @@ def preprocess_image(
     tissue_mask = _extract_brain_mask(gray_resampled)
     io.imsave(mask_output_path, (tissue_mask.astype(np.uint8) * 255))
 
-    canvas_output_path = str(mask_output_path).replace('_mask.tif', '_masked_on_1100x800_black.tif')
-    mask_canvas_output_path = str(mask_output_path).replace('_mask.tif', '_mask_on_1100x800_black.tif')
+    if brain_layout not in ('auto', 'whole', 'left', 'right'):
+        raise ValueError('brain_layout must be one of: auto, whole, left, right')
+    if brain_layout == 'auto':
+        resolved_brain_layout, layout_diagnostics = _infer_brain_layout(tissue_mask)
+    else:
+        resolved_brain_layout = brain_layout
+        layout_diagnostics = {
+            'reason': 'manual_layout_selected',
+            'inference_skipped': True,
+        }
+
+    if resolved_brain_layout in ('left', 'right'):
+        anatomical_midline_col, midline_diagnostics = _estimate_anatomical_midline(
+            tissue_mask, resolved_brain_layout,
+        )
+    else:
+        anatomical_midline_col = None
+        midline_diagnostics = {
+            'reason': 'whole_brain_uses_image_center',
+            'estimation_skipped': True,
+        }
+    print(
+        f'Brain layout: requested={brain_layout}, resolved={resolved_brain_layout}'
+    )
+    if resolved_brain_layout == 'whole':
+        print('Whole brain selected; midline estimation skipped and image center used')
+    elif anatomical_midline_col is not None:
+        print(f'Anatomical midline detected at input column {anatomical_midline_col}')
+    else:
+        print('No confident internal midline detected; using layout fallback alignment')
+
+    canvas_output_path = str(mask_output_path).replace('_mask.tif', '_masked_on_1140x800_black.tif')
+    mask_canvas_output_path = str(mask_output_path).replace('_mask.tif', '_mask_on_1140x800_black.tif')
     _, _ = _save_masked_brain_on_canvas(
         gray_resampled,
         tissue_mask,
         canvas_output_path,
-        canvas_width=1100,
-        canvas_height=800,
+        canvas_width=CANVAS_WIDTH,
+        canvas_height=CANVAS_HEIGHT,
         mask_canvas_output_path=mask_canvas_output_path,
+        brain_layout=resolved_brain_layout,
+        anatomical_midline_col=anatomical_midline_col,
     )
     
     # Generate high-resolution canvas at original image resolution
@@ -283,8 +631,10 @@ def preprocess_image(
         tissue_mask,
         gray_resampled.shape,
         fullres_canvas_output_path,
-        canvas_width=1100,
-        canvas_height=800,
+        canvas_width=CANVAS_WIDTH,
+        canvas_height=CANVAS_HEIGHT,
+        brain_layout=resolved_brain_layout,
+        anatomical_midline_col=anatomical_midline_col,
     )
 
     nz = np.argwhere(tissue_mask)
@@ -309,19 +659,27 @@ def preprocess_image(
         'params': {
             'input_res_um_per_px': float(input_res),
             'target_res_um_per_px': float(target_res),
+            'replace_background_values': bool(replace_background_values),
+            'rotation_degrees_counterclockwise': int(rotation),
+            'brain_layout_requested': str(brain_layout),
+            'brain_layout_resolved': str(resolved_brain_layout),
+            'grayscale_mode': str(grayscale_mode),
             'resample_scale': float(scale),
-            'canvas_width': 1100,
-            'canvas_height': 800,
+            'canvas_width': CANVAS_WIDTH,
+            'canvas_height': CANVAS_HEIGHT,
             'fullres_canvas_shape': [int(fullres_canvas_shape[0]), int(fullres_canvas_shape[1])],
         },
         'stats': {
-            'input_shape': [int(v) for v in img_arr.shape],
+            'input_shape': [int(v) for v in original_input_shape],
+            'processed_input_shape': [int(v) for v in img_arr.shape],
             'background_replaced_pixels': int(replaced_pixels),
             'gray_shape': [int(v) for v in gray.shape],
             'resampled_shape': [int(v) for v in gray_resampled.shape],
             'fullres_canvas_shape': [int(fullres_canvas_shape[0]), int(fullres_canvas_shape[1])],
             'mask_coverage': float(tissue_mask.mean()),
             'mask_bbox_r0c0r1c1': mask_bbox,
+            'brain_layout_diagnostics': layout_diagnostics,
+            'anatomical_midline_diagnostics': midline_diagnostics,
         },
     }
     with open(record_json_path, 'w') as f:
@@ -329,9 +687,9 @@ def preprocess_image(
 
     print(f'Tissue mask saved to {mask_output_path}')
     print(f'Mask coverage: {tissue_mask.mean() * 100:.2f}%')
-    print(f'Masked brain on 1100x800 black canvas saved to {canvas_output_path}')
+    print(f'Masked brain on 1140x800 black canvas saved to {canvas_output_path}')
     print(f'Masked brain on fullres black canvas saved to {fullres_canvas_output_path}')
-    print(f'Mask on 1100x800 black canvas saved to {mask_canvas_output_path}')
+    print(f'Mask on 1140x800 black canvas saved to {mask_canvas_output_path}')
     print(f'Step1 record json saved to {record_json_path}')
 
     _cleanup_images(img_arr, gray, gray_resampled, tissue_mask)
@@ -339,34 +697,25 @@ def preprocess_image(
     return record_json_path
 
 
-def _build_arg_parser():
-    parser = argparse.ArgumentParser(description='Step1: gray and resample')
-    parser.add_argument('-i', '--input-path', required=True, help='input image path')
-    parser.add_argument('-g', '--gray-output-path', required=True, help='gray image output path')
-    parser.add_argument('-r', '--resampled-output-path', required=True, help='resampled gray image output path')
-    parser.add_argument('-m', '--mask-output-path', required=True, help='tissue mask output path ')
-    parser.add_argument('--input-res', type=float, default=0.294, help='input resolution (um/px)')
-    parser.add_argument('--target-res', type=float, default=10.0, help='target resolution (um/px)')
-    return parser
-
-
 if __name__ == '__main__':
     args = _build_arg_parser().parse_args()
-    out_dir = os.path.dirname(args.gray_output_path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-    out_dir2 = os.path.dirname(args.resampled_output_path)
-    if out_dir2:
-        os.makedirs(out_dir2, exist_ok=True)
+    input_path = Path(args.input_path)
+    output_path = Path(args.output_path) if args.output_path else input_path.parent / '01.preprocess'
+    output_path.mkdir(parents=True, exist_ok=True)
+    image_name = input_path.stem
 
     try:
         record_json_path = preprocess_image(
-            input_path=args.input_path,
-            gray_output_path=args.gray_output_path,
-            resampled_output_path=args.resampled_output_path,
-            mask_output_path=args.mask_output_path,
+            input_path=input_path,
+            gray_output_path=output_path / f'{image_name}_gray.tif',
+            resampled_output_path=output_path / f'{image_name}_resampled.tif',
+            mask_output_path=output_path / f'{image_name}_mask.tif',
             input_res=args.input_res,
             target_res=args.target_res,
+            replace_background_values=args.replace_background_values,
+            rotation=args.rotation,
+            brain_layout=args.brain_layout,
+            grayscale_mode=args.grayscale_mode,
         )
     finally:
         _cleanup_images()

@@ -9,6 +9,18 @@ import numpy as np
 import SimpleITK as sitk
 from skimage import io
 import gc
+from pathlib import Path
+
+
+def _build_arg_parser():
+    parser = argparse.ArgumentParser(
+        description='Step5: optionally generate ROI masks from the Step4 result'
+    )
+    parser.add_argument('--step4-record-json', required=True, help='Step4 record JSON path')
+    parser.add_argument('--roi-txt-path', default=None, help='optional ROI list; Step5 is skipped when omitted')
+    parser.add_argument('--structure-tree-csv', default=None, help='structure_tree_safe_2017.csv; required when ROI list is provided')
+    parser.add_argument('--output-path', default=None, help='output directory; default: sibling 05.roi_mask directory')
+    return parser
 
 
 def _load_label_image(label_path, atlas_slice=None):
@@ -25,7 +37,7 @@ def _load_label_image(label_path, atlas_slice=None):
     return image
 
 
-def _place_on_canvas(arr, tissue_mask, canvas_width=1100, canvas_height=800):
+def _place_on_canvas(arr, tissue_mask, canvas_width=1140, canvas_height=800):
     masked = arr.astype(np.float32) * tissue_mask.astype(np.float32)
     nz = np.argwhere(tissue_mask)
     canvas = np.zeros((canvas_height, canvas_width), dtype=np.float32)
@@ -226,7 +238,7 @@ def _read_image_hw(image_path):
 
 
 def _scale_mask_to_fullres(mask_arr, step1_info):
-    """Scale mask from 1152x832 canvas resolution to Step1 masked_on_fullres_black.tif size."""
+    """Scale a mask from the Step4 reference canvas to the Step1 full-resolution canvas."""
     if step1_info is None:
         return None
 
@@ -355,10 +367,10 @@ def generate_roi_masks(
             )
             continue
 
-        # Save downsampled resolution mask (standard canvas size: 1152x832)
+        # Save at the Step4 reference canvas resolution (currently 1140x800, width x height).
         out_name = f'{_sanitize_filename(roi)}_mask.tif'
         out_path = os.path.join(output_dir, out_name)
-        io.imsave(out_path, (mask.astype(np.uint8) * 255))
+        PIL.Image.fromarray((mask.astype(np.uint8) * 255)).save(out_path)
         mask_paths[roi] = out_path
         
         # Generate high-resolution grayscale mask
@@ -370,7 +382,7 @@ def generate_roi_masks(
                     gray = (mask_fullres.astype(np.uint8) * 255)
                     out_name_gray = f'{_sanitize_filename(roi)}_mask_fullres_gray.png'
                     fullres_mask_path = os.path.join(output_dir, out_name_gray)
-                    io.imsave(fullres_mask_path, gray)
+                    PIL.Image.fromarray(gray).save(fullres_mask_path)
                     fullres_mask_paths[roi] = fullres_mask_path
             except Exception as e:
                 print(f'Warning: failed to generate fullres grayscale mask for {roi}: {e}')
@@ -435,25 +447,25 @@ def generate_roi_masks(
     return report_csv, record_json
 
 
-def _build_arg_parser():
-    parser = argparse.ArgumentParser(
-        description='Step5: generate ROI masks after step4 using ROI list and structure tree annotations'
-    )
-    parser.add_argument('--step4-record-json', required=True, help='step4 record json path (_step4_record.json)')
-    parser.add_argument('--roi-txt-path', required=True, help='ROI list txt file (one ROI acronym/name per line)')
-    parser.add_argument('--structure-tree-csv', required=True, help='structure_tree_safe_2017.csv path')
-    parser.add_argument('--output-dir', required=True, help='output directory for ROI masks')
-    return parser
-
-
 if __name__ == '__main__':
     args = _build_arg_parser().parse_args()
-    try:
-        generate_roi_masks(
-            step4_record_json=args.step4_record_json,
-            roi_txt_path=args.roi_txt_path,
-            structure_tree_csv=args.structure_tree_csv,
-            output_dir=args.output_dir,
+    if args.roi_txt_path is None:
+        print('Step5 skipped: --roi-txt-path was not provided')
+    else:
+        if args.structure_tree_csv is None:
+            raise ValueError('--structure-tree-csv is required when --roi-txt-path is provided')
+        step4_record_path = Path(args.step4_record_json)
+        output_path = (
+            Path(args.output_path)
+            if args.output_path is not None
+            else step4_record_path.parent.parent / '05.roi_mask'
         )
-    finally:
-        _cleanup_images()
+        try:
+            generate_roi_masks(
+                step4_record_json=step4_record_path,
+                roi_txt_path=Path(args.roi_txt_path),
+                structure_tree_csv=Path(args.structure_tree_csv),
+                output_dir=output_path,
+            )
+        finally:
+            _cleanup_images()

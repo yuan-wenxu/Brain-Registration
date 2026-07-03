@@ -1,0 +1,33 @@
+# Copy this file to registration.conf and replace the paths with local values.
+
+ATLAS_NISSL="/path/to/ara_nissl_10.npy"
+ATLAS_ANNOTATION="/path/to/annotation_10.npy"
+STRUCTURE_TREE_CSV="/path/to/structure_tree_safe_2017.csv"
+
+# Leave empty to skip Step5.
+ROI_TXT_PATH=""
+
+# Leave empty to create output directories beside the input image.
+OUTPUT_PATH=""
+
+# Step1
+INPUT_RES="0.294"
+TARGET_RES="10.0"
+BRAIN_LAYOUT="auto"
+REPLACE_BACKGROUND_VALUES="1"
+
+# Step2
+ATLAS_SLICE=""
+SLICE_SEARCH_RADIUS="200"
+SLICE_SEARCH_STEP="20"
+SEARCH_RESIZE_MAX="0.6"
+WORKERS="8"
+NEIGHBOR_SMOOTH_SIGMA="3.0"
+
+RANDOM_SEED="42"
+
+# Step3
+METRIC_MODE="weighted"
+WEIGHT_FLOOR="0.25"
+MESH_SIZE="8"
+SAMPLING_PERCENTAGE="0.25"
