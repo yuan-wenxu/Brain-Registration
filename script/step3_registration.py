@@ -8,6 +8,7 @@ import numpy as np
 import SimpleITK as sitk
 from skimage import io, transform
 from matplotlib import colormaps
+from step2_select_slice import _hemisphere_registration_bbox
 from utils.registration import (
     rigid_register,
     affine_register,
@@ -84,6 +85,20 @@ def _to_sitk_with_like(arr, like_image):
     return img
 
 
+def _sitk_crop_with_origin(image, r0, c0, r1, c1):
+    """Crop a SimpleITK image and set origin so physical coordinates match the full image."""
+    arr = sitk.GetArrayFromImage(image)
+    cropped_arr = arr[r0:r1, c0:c1]
+    cropped = sitk.GetImageFromArray(cropped_arr.astype(np.float32))
+    cropped.SetSpacing(image.GetSpacing())
+    origin = image.GetOrigin()
+    cropped.SetOrigin((
+        origin[0] + c0 * image.GetSpacing()[0],
+        origin[1] + r0 * image.GetSpacing()[1],
+    ))
+    return cropped
+
+
 def _load_dense_weight_from_step2(step2_record_json, target_shape):
     if step2_record_json is None or not Path(step2_record_json).exists():
         return None, None, None
@@ -153,6 +168,10 @@ def _load_step2_inputs(step2_record_json, output_path=None):
     input_path = step1.get('input_path')
     sample_name = Path(input_path).stem if input_path else fixed_path.stem
 
+    brain_layout = step1.get('params', {}).get('brain_layout_resolved', 'whole')
+    mask_canvas_path = step1.get('outputs', {}).get('mask_canvas_path')
+    cut_column = step1.get('stats', {}).get('cut_edge_canvas_col')
+
     output_dir = (
         Path(output_path)
         if output_path is not None
@@ -164,6 +183,9 @@ def _load_step2_inputs(step2_record_json, output_path=None):
         'moving_path': moving_path,
         'output_path': output_dir / f'{sample_name}_registration.tif',
         'transform_path': output_dir / f'{sample_name}_registration.h5',
+        'brain_layout': brain_layout,
+        'mask_canvas_path': Path(mask_canvas_path) if mask_canvas_path else None,
+        'cut_column': cut_column,
     }
 
 
@@ -181,12 +203,34 @@ def register(
     moving_path = str(paths['moving_path'])
     output_path = paths['output_path']
     transform_path = str(paths['transform_path'])
+    brain_layout = paths['brain_layout']
+    mask_canvas_path = paths['mask_canvas_path']
+    cut_column = paths['cut_column']
     _set_global_determinism(seed=random_seed)
 
     fixed = sitk.ReadImage(fixed_path, sitk.sitkFloat32)
     moving = sitk.ReadImage(moving_path, sitk.sitkFloat32)
     fixed_arr = sitk.GetArrayFromImage(fixed)
     output_path = str(output_path)
+
+    # Half-brain: crop at the specimen's straight cut edge detected by Step1,
+    # while retaining the complete image height.
+    crop_bbox = None
+    if brain_layout in ('left', 'right'):
+        crop_bbox = _hemisphere_registration_bbox(
+            fixed_arr.shape, brain_layout, cut_column,
+        )
+        r0, c0, r1, c1 = crop_bbox
+        crop_source = 'detected tissue cut edge' if cut_column is not None else 'canvas center fallback'
+        print(
+            f'Half-brain layout ({brain_layout}): cropping at {crop_source} '
+            f'[{r0}:{r1}, {c0}:{c1}] for rigid/affine'
+        )
+        fixed_crop = _sitk_crop_with_origin(fixed, r0, c0, r1, c1)
+        moving_crop = _sitk_crop_with_origin(moving, r0, c0, r1, c1)
+    else:
+        fixed_crop = fixed
+        moving_crop = moving
 
     metric_history = []
     dense_weight_arr = None
@@ -210,31 +254,83 @@ def register(
         io.imsave(metric_weight_tif, (np.clip(soft_weight, 0, 1) * 65535).astype(np.uint16))
         print(f'Using weighted metric in step3 stage1, coverage={dense_weight_stats["coverage"]*100:.1f}%')
 
-    rigid = rigid_register(
-        fixed, moving,
-        sampling_seed=int(random_seed) + 101,
-        learning_rate=0.05,
-        number_of_iterations=280,
-        shrink_factors=(8, 4, 2, 1),
-        smoothing_sigmas=(4, 2, 1, 0),
-        metric_history=metric_history,
-        stage_name='rigid',
-    )
-    affine = affine_register(
-        fixed, rigid['image'],
-        center=rigid['transform'].GetCenter(),
-        sampling_seed=int(random_seed) + 131,
-        learning_rate=0.05,
-        number_of_iterations=700,
-        shrink_factors=(8, 4, 2, 1),
-        smoothing_sigmas=(4, 2, 1, 0),
-        metric_history=metric_history,
-        stage_name='affine',
-    )
+    if crop_bbox is not None:
+        # Register on cropped images (same spatial region, no compression)
+        rigid = rigid_register(
+            fixed_crop, moving_crop,
+            sampling_seed=int(random_seed) + 101,
+            learning_rate=0.05,
+            number_of_iterations=280,
+            shrink_factors=(8, 4, 2, 1),
+            smoothing_sigmas=(4, 2, 1, 0),
+            metric_history=metric_history,
+            stage_name='rigid',
+        )
+        # Apply rigid to full atlas, resample ONLY onto cropped region
+        rigid_result_crop = sitk.Resample(
+            moving, fixed_crop, rigid['transform'], sitk.sitkLinear, 0.0, moving.GetPixelID()
+        )
+        affine = affine_register(
+            fixed_crop, rigid_result_crop,
+            center=rigid['transform'].GetCenter(),
+            sampling_seed=int(random_seed) + 131,
+            learning_rate=0.05,
+            number_of_iterations=700,
+            shrink_factors=(8, 4, 2, 1),
+            smoothing_sigmas=(4, 2, 1, 0),
+            metric_history=metric_history,
+            stage_name='affine',
+        )
+    else:
+        rigid = rigid_register(
+            fixed, moving,
+            sampling_seed=int(random_seed) + 101,
+            learning_rate=0.05,
+            number_of_iterations=280,
+            shrink_factors=(8, 4, 2, 1),
+            smoothing_sigmas=(4, 2, 1, 0),
+            metric_history=metric_history,
+            stage_name='rigid',
+        )
+        affine = affine_register(
+            fixed, rigid['image'],
+            center=rigid['transform'].GetCenter(),
+            sampling_seed=int(random_seed) + 131,
+            learning_rate=0.05,
+            number_of_iterations=700,
+            shrink_factors=(8, 4, 2, 1),
+            smoothing_sigmas=(4, 2, 1, 0),
+            metric_history=metric_history,
+            stage_name='affine',
+        )
     affine_result = affine['image']
+    # For half-brain, apply composed rigid+affine to full atlas, resample onto cropped region,
+    # then place result on full canvas for bspline stage
+    if crop_bbox is not None:
+        rigid_affine_composed = compose_transforms(rigid['transform'], affine['transform'])
+        affine_result_crop = sitk.Resample(
+            moving, fixed_crop, rigid_affine_composed, sitk.sitkLinear, 0.0, moving.GetPixelID()
+        )
+        # Place cropped result on full canvas
+        affine_arr = sitk.GetArrayFromImage(affine_result_crop)
+        canvas_arr = np.zeros(fixed_arr.shape, dtype=np.float32)
+        canvas_arr[r0:r1, c0:c1] = affine_arr
+        affine_result = sitk.GetImageFromArray(canvas_arr)
+        affine_result.CopyInformation(fixed)
     rigid_output_tif = output_path.replace('_registration.tif', '_rigid.tif')
     affine_output_tif = output_path.replace('_registration.tif', '_affine.tif')
-    io.imsave(rigid_output_tif, _to_u16(sitk.GetArrayFromImage(rigid['image'])))
+    if crop_bbox is not None:
+        # Place rigid result on full canvas
+        rigid_result_crop = sitk.Resample(
+            moving, fixed_crop, rigid['transform'], sitk.sitkLinear, 0.0, moving.GetPixelID()
+        )
+        rigid_arr = sitk.GetArrayFromImage(rigid_result_crop)
+        rigid_canvas = np.zeros(fixed_arr.shape, dtype=np.float32)
+        rigid_canvas[r0:r1, c0:c1] = rigid_arr
+        io.imsave(rigid_output_tif, _to_u16(rigid_canvas))
+        _cleanup_images(rigid_result_crop)
+    else:
+        io.imsave(rigid_output_tif, _to_u16(sitk.GetArrayFromImage(rigid['image'])))
     io.imsave(affine_output_tif, _to_u16(sitk.GetArrayFromImage(affine_result)))
 
     stage1 = bspline_register(
@@ -276,6 +372,12 @@ def register(
     )
 
     result_arr = sitk.GetArrayFromImage(result)
+
+    # Apply tissue mask to registration result (zero out non-brain areas)
+    if mask_canvas_path is not None and mask_canvas_path.exists():
+        mask_arr = sitk.GetArrayFromImage(sitk.ReadImage(str(mask_canvas_path), sitk.sitkUInt8))
+        mask_binary = (mask_arr > 127)
+        result_arr = result_arr * mask_binary
 
     sitk.WriteTransform(complete_transform, transform_path)
     io.imsave(output_path, _to_u16(result_arr))

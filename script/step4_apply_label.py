@@ -225,6 +225,16 @@ def apply_transform_to_label(
         with open(step2_record_json, 'r') as f:
             s2 = json.load(f)
         atlas_slice = int(s2['selected_slice'])
+        step1_record_path = s2.get('step1_record_json')
+    else:
+        step1_record_path = None
+
+    # Load step1 record for mask path
+    mask_canvas_path = None
+    if step1_record_path and os.path.exists(str(step1_record_path)):
+        with open(step1_record_path, 'r') as f:
+            step1_info = json.load(f)
+        mask_canvas_path = step1_info.get('outputs', {}).get('mask_canvas_path')
 
     step3_chain = []
     if step3_record_json is not None and os.path.exists(str(step3_record_json)):
@@ -267,6 +277,13 @@ def apply_transform_to_label(
     output_path = str(output_path)
     warped_arr = sitk.GetArrayFromImage(warped_label)
     ref_arr = sitk.GetArrayFromImage(reference)
+
+    # Apply tissue mask to warped label (zero out non-brain areas)
+    if mask_canvas_path and os.path.exists(str(mask_canvas_path)):
+        mask_arr = sitk.GetArrayFromImage(sitk.ReadImage(str(mask_canvas_path), sitk.sitkUInt8))
+        mask_binary = (mask_arr > 127).astype(np.uint16)
+        warped_arr = warped_arr * mask_binary
+
     overlay_rgb_tif = output_path.replace('_label.tif', '_overlay.tif')
     io.imsave(output_path, _label_to_color_rgb(warped_arr))
     _save_label_overlay_tif(ref_arr, warped_arr, overlay_rgb_tif, alpha=0.45)

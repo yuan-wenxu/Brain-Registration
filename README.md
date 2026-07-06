@@ -7,6 +7,7 @@ Register a mouse brain section to the Allen Mouse Brain Atlas, transform the All
 Install [Pixi](https://pixi.prefix.dev/) first, then run:
 
 ```bash
+cd /path/to/Brain-Registration
 pixi run init
 source ~/.bashrc
 br --help
@@ -40,6 +41,9 @@ Set the ROI path to an empty string to skip Step5:
 ROI_TXT_PATH=""
 ```
 
+Set `ATLAS_SLICE` when the approximate anatomical level is known. It defines
+the search center; leave it empty for fully automatic image-only selection.
+
 `config/ROI.txt.example` is the ROI template.
 ## Usage
 
@@ -56,10 +60,17 @@ Nissl stain grayscale conversion:
 ```bash
 br nissl \
   --input /path/to/brain.tif \
-  --rotation 90
+  --rotation 90 \
+  --input-res 0.294
 ```
 
 `--rotation` is counterclockwise and accepts `0`, `90`, `180`, or `270`. Use `--config /path/to/another.conf` to override the default configuration.
+Use `--output /path/to/result` to keep complete results separate when multiple
+input images share one directory.
+Use `--input-res UM_PER_PX` for images whose source resolution differs from the
+configuration default. The command-line value applies only to that run and
+takes precedence over `INPUT_RES` in the configuration file.
+Use `--remove-grid` only when the image contains periodic grid artifacts.
 
 ## Inputs
 
@@ -100,19 +111,25 @@ Main outputs:
   *_gray.tif
   *_resampled.tif
   *_mask.tif
+  *_mask_on_1140x800_black.tif
   *_masked_on_1140x800_black.tif
+  *_masked_degridded_on_1140x800_black.tif  # only with --remove-grid
+  *_masked_on_fullres_black.tif
   *_step1_record.json
 
 02.select_slice/
   selected_slice.tif
   slice_search_metrics.csv
   slice_score_curve.png
+  dense_weight.tif
   step2_record.json
 
 03.registration/
   *_rigid.tif
   *_affine.tif
   *_registration.tif
+  *_overlay_on_step1_rgb.tif
+  *_weight_from_step2_dense_weight.tif
   *_registration.h5
   *_metric_history.csv
   *_step3_record.json
@@ -121,6 +138,7 @@ Main outputs:
   *_label.tif
   *_overlay.tif
   *_region_distribution.csv
+  *_annotation_nissl_merge.tif
   *_step4_record.json
 
 05.roi_mask/

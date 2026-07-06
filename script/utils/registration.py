@@ -71,6 +71,8 @@ def rigid_register(
     smoothing_sigmas=(2, 1, 0),
     metric_history=None,
     stage_name='rigid',
+    fixed_mask=None,
+    moving_mask=None,
 ):
     initial = sitk.CenteredTransformInitializer(
         fixed,
@@ -85,6 +87,10 @@ def rigid_register(
         shrink_factors, smoothing_sigmas,
     )
     registration.SetInitialTransform(initial, inPlace=False)
+    if fixed_mask is not None:
+        registration.SetMetricFixedMask(sitk.Cast(fixed_mask, sitk.sitkUInt8))
+    if moving_mask is not None:
+        registration.SetMetricMovingMask(sitk.Cast(moving_mask, sitk.sitkUInt8))
     if metric_history is not None:
         registration.AddCommand(
             sitk.sitkIterationEvent,
@@ -117,6 +123,8 @@ def affine_register(
     smoothing_sigmas=(2, 1, 0),
     metric_history=None,
     stage_name='affine',
+    fixed_mask=None,
+    moving_mask=None,
 ):
     initial = sitk.AffineTransform(2)
     if center is not None:
@@ -128,6 +136,10 @@ def affine_register(
         shrink_factors, smoothing_sigmas,
     )
     registration.SetInitialTransform(initial, inPlace=False)
+    if fixed_mask is not None:
+        registration.SetMetricFixedMask(sitk.Cast(fixed_mask, sitk.sitkUInt8))
+    if moving_mask is not None:
+        registration.SetMetricMovingMask(sitk.Cast(moving_mask, sitk.sitkUInt8))
     if metric_history is not None:
         registration.AddCommand(
             sitk.sitkIterationEvent,

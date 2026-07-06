@@ -10,17 +10,23 @@ INPUT_PATH=""
 CONFIG_PATH="${ROOT_DIR}/config/registration.conf"
 GRAYSCALE_MODE=""
 ROTATION="0"
+CLI_INPUT_RES=""
+CLI_REMOVE_GRID=""
+CLI_OUTPUT_PATH=""
 
 usage() {
     cat <<EOF
 Usage:
-  $PROGRAM_NAME rgb|nissl --input /path/brain.tif [--config /path/registration.conf] [--rotation 0|90|180|270]
+  $PROGRAM_NAME rgb|nissl --input /path/brain.tif [--output /path/result] [--config /path/registration.conf] [--rotation 0|90|180|270] [--input-res UM_PER_PX] [--remove-grid]
 
 Required:
   rgb|nissl                         Grayscale conversion mode
   --input PATH
+  --output PATH                     Override OUTPUT_PATH for this run
   --config PATH                     Optional; default: config/registration.conf
   --rotation 0|90|180|270           Counterclockwise degrees; default: 0
+  --input-res UM_PER_PX             Override INPUT_RES for this image
+  --remove-grid                     Generate a degridded Step1 image for Step2 and Step3
 
 Set ROI_TXT_PATH in the configuration file to run Step5. Leave it empty to skip Step5.
 EOF
@@ -44,8 +50,11 @@ fi
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --input) INPUT_PATH="$2"; shift 2 ;;
+        --output) CLI_OUTPUT_PATH="$2"; shift 2 ;;
         --config) CONFIG_PATH="$2"; shift 2 ;;
         --rotation) ROTATION="$2"; shift 2 ;;
+        --input-res) CLI_INPUT_RES="$2"; shift 2 ;;
+        --remove-grid) CLI_REMOVE_GRID="1"; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -60,6 +69,10 @@ case "$ROTATION" in
     0|90|180|270) ;;
     *) echo "--rotation must be 0, 90, 180, or 270." >&2; exit 2 ;;
 esac
+if [[ -n "$CLI_INPUT_RES" ]] && ! awk -v value="$CLI_INPUT_RES" 'BEGIN { exit !(value + 0 > 0) }'; then
+    echo "--input-res must be a positive number." >&2
+    exit 2
+fi
 for required_path in "$INPUT_PATH" "$CONFIG_PATH"; do
     if [[ ! -f "$required_path" ]]; then
         echo "Input file does not exist: $required_path" >&2
@@ -89,12 +102,23 @@ ROTATION="$CLI_ROTATION"
 : "${RANDOM_SEED:=42}"
 : "${WORKERS:=8}"
 : "${NEIGHBOR_SMOOTH_SIGMA:=3.0}"
+: "${REMOVE_GRID:=0}"
 : "${METRIC_MODE:=weighted}"
 : "${WEIGHT_FLOOR:=0.25}"
 : "${MESH_SIZE:=8}"
 : "${SAMPLING_PERCENTAGE:=0.25}"
 : "${ROI_TXT_PATH:=}"
 : "${STRUCTURE_TREE_CSV:=}"
+
+if [[ -n "$CLI_INPUT_RES" ]]; then
+    INPUT_RES="$CLI_INPUT_RES"
+fi
+if [[ -n "$CLI_REMOVE_GRID" ]]; then
+    REMOVE_GRID="$CLI_REMOVE_GRID"
+fi
+if [[ -n "$CLI_OUTPUT_PATH" ]]; then
+    OUTPUT_PATH="$CLI_OUTPUT_PATH"
+fi
 
 for atlas_path in "$ATLAS_NISSL" "$ATLAS_ANNOTATION"; do
     if [[ ! -f "$atlas_path" ]]; then
@@ -144,6 +168,9 @@ if [[ "$REPLACE_BACKGROUND_VALUES" == "1" ]]; then
     STEP1_ARGS+=(--replace-background-values)
 else
     STEP1_ARGS+=(--no-replace-background-values)
+fi
+if [[ "$REMOVE_GRID" == "1" ]]; then
+    STEP1_ARGS+=(--remove-grid)
 fi
 "${PYTHON_CMD[@]}" "${SCRIPT_DIR}/step1_preprocess.py" "${STEP1_ARGS[@]}"
 

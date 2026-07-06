@@ -17,12 +17,15 @@ BRAIN_LAYOUT="auto"
 REPLACE_BACKGROUND_VALUES="1"
 
 # Step2
+# Optional expected slice used as the search center.
 ATLAS_SLICE=""
 SLICE_SEARCH_RADIUS="200"
 SLICE_SEARCH_STEP="20"
 SEARCH_RESIZE_MAX="0.6"
 WORKERS="8"
 NEIGHBOR_SMOOTH_SIGMA="3.0"
+# Set to 1 to generate a degridded Step1 canvas for Step2 and Step3.
+REMOVE_GRID="0"
 
 RANDOM_SEED="42"
 

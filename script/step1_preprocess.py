@@ -11,6 +11,7 @@ from skimage.filters import threshold_otsu, gaussian
 from skimage import morphology
 from scipy.ndimage import binary_fill_holes, gaussian_filter1d
 from scipy.signal import find_peaks
+from utils.image_processing import remove_periodic_grid
 
 
 CANVAS_WIDTH = 1140
@@ -55,6 +56,11 @@ def _build_arg_parser():
         action=argparse.BooleanOptionalAction,
         default=True,
         help='remove white-gray mosaic background by replacing uint8 values 255 and 204 with zero (default: enabled)',
+    )
+    parser.add_argument(
+        '--remove-grid',
+        action='store_true',
+        help='remove periodic grid artifacts from the downstream registration image',
     )
     return parser
 
@@ -399,6 +405,26 @@ def _canvas_position(
     return top, left
 
 
+def _estimate_canvas_cut_column(mask_canvas, brain_layout):
+    """Estimate the specimen's straight cut edge on the placed canvas."""
+    if brain_layout not in ('left', 'right'):
+        return None
+    mask_binary = np.asarray(mask_canvas) > 0
+    edges = []
+    for row in mask_binary:
+        columns = np.flatnonzero(row)
+        if columns.size:
+            edges.append(int(columns[0] if brain_layout == 'right' else columns[-1]))
+    if not edges:
+        return None
+    values, counts = np.unique(edges, return_counts=True)
+    best = int(np.argmax(counts))
+    # A real sectioning edge should persist across a substantial vertical span.
+    if int(counts[best]) < max(10, int(0.25 * len(edges))):
+        return None
+    return int(values[best])
+
+
 def _save_masked_brain_on_canvas(
     gray_resampled,
     tissue_mask,
@@ -536,6 +562,7 @@ def preprocess_image(
     rotation=0,
     brain_layout='auto',
     grayscale_mode='rgb',
+    remove_grid=False,
 ):
     """
     Step1: gray image + resample
@@ -613,7 +640,7 @@ def preprocess_image(
 
     canvas_output_path = str(mask_output_path).replace('_mask.tif', '_masked_on_1140x800_black.tif')
     mask_canvas_output_path = str(mask_output_path).replace('_mask.tif', '_mask_on_1140x800_black.tif')
-    _, _ = _save_masked_brain_on_canvas(
+    canvas, mask_canvas = _save_masked_brain_on_canvas(
         gray_resampled,
         tissue_mask,
         canvas_output_path,
@@ -623,6 +650,35 @@ def preprocess_image(
         brain_layout=resolved_brain_layout,
         anatomical_midline_col=anatomical_midline_col,
     )
+    cut_edge_canvas_col = _estimate_canvas_cut_column(
+        mask_canvas, resolved_brain_layout,
+    )
+    if cut_edge_canvas_col is not None:
+        print(f'Straight tissue cut edge detected at canvas column {cut_edge_canvas_col}')
+
+    downstream_canvas_path = canvas_output_path
+    degridded_canvas_path = None
+    grid_removal_diagnostics = {
+        'requested': bool(remove_grid),
+        'applied': False,
+    }
+    degridded_canvas = None
+    if remove_grid:
+        degridded_canvas, grid_removal_diagnostics = remove_periodic_grid(
+            canvas,
+            tissue_mask=np.asarray(mask_canvas, dtype=np.float32) / 255.0,
+        )
+        grid_removal_diagnostics['requested'] = True
+        degridded_canvas_path = str(canvas_output_path).replace(
+            '_masked_on_1140x800_black.tif',
+            '_masked_degridded_on_1140x800_black.tif',
+        )
+        io.imsave(
+            degridded_canvas_path,
+            (np.clip(degridded_canvas, 0, 1) * 65535).astype(np.uint16),
+        )
+        downstream_canvas_path = degridded_canvas_path
+        print(f'Degridded downstream canvas saved to {degridded_canvas_path}')
     
     # Generate high-resolution canvas at original image resolution
     fullres_canvas_output_path = str(mask_output_path).replace('_mask.tif', '_masked_on_fullres_black.tif')
@@ -653,6 +709,8 @@ def preprocess_image(
             'resampled_path': str(resampled_output_path),
             'mask_path': str(mask_output_path),
             'masked_canvas_path': str(canvas_output_path),
+            'downstream_canvas_path': str(downstream_canvas_path),
+            'degridded_canvas_path': str(degridded_canvas_path) if degridded_canvas_path else None,
             'mask_canvas_path': str(mask_canvas_output_path),
             'masked_fullres_canvas_path': str(fullres_canvas_output_path),
         },
@@ -664,6 +722,7 @@ def preprocess_image(
             'brain_layout_requested': str(brain_layout),
             'brain_layout_resolved': str(resolved_brain_layout),
             'grayscale_mode': str(grayscale_mode),
+            'remove_grid': bool(remove_grid),
             'resample_scale': float(scale),
             'canvas_width': CANVAS_WIDTH,
             'canvas_height': CANVAS_HEIGHT,
@@ -680,6 +739,8 @@ def preprocess_image(
             'mask_bbox_r0c0r1c1': mask_bbox,
             'brain_layout_diagnostics': layout_diagnostics,
             'anatomical_midline_diagnostics': midline_diagnostics,
+            'cut_edge_canvas_col': cut_edge_canvas_col,
+            'grid_removal_diagnostics': grid_removal_diagnostics,
         },
     }
     with open(record_json_path, 'w') as f:
@@ -692,7 +753,7 @@ def preprocess_image(
     print(f'Mask on 1140x800 black canvas saved to {mask_canvas_output_path}')
     print(f'Step1 record json saved to {record_json_path}')
 
-    _cleanup_images(img_arr, gray, gray_resampled, tissue_mask)
+    _cleanup_images(img_arr, gray, gray_resampled, tissue_mask, canvas, mask_canvas, degridded_canvas)
 
     return record_json_path
 
@@ -716,6 +777,7 @@ if __name__ == '__main__':
             rotation=args.rotation,
             brain_layout=args.brain_layout,
             grayscale_mode=args.grayscale_mode,
+            remove_grid=args.remove_grid,
         )
     finally:
         _cleanup_images()
